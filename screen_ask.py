@@ -54,6 +54,35 @@ ACCENT = "#ff4a1c"
 
 PH = "问这个画面里的任何东西…"
 
+# DeepSeek 官方定价（USD / 1M tokens）
+# 来源 api-docs.deepseek.com/quick_start/pricing，2026-10 核对
+# 高峰 = UTC 01:00-04:00 与 06:00-10:00 的工作日（= 北京 09-12 / 14-18）
+# 中国法定节假日未排除，节假日会被按高峰计价，略高估
+PRICE = {
+    "peak":    (0.006, 0.30, 1.2),   # (cache hit, cache miss, output)
+    "offpeak": (0.003, 0.15, 0.6),
+}
+USD_CNY = 7.15
+
+
+def is_peak(now=None):
+    import datetime as _dt
+    t = now or _dt.datetime.now(_dt.timezone.utc)
+    if t.weekday() >= 5:
+        return False
+    h = t.hour + t.minute / 60.0
+    return (1.0 <= h < 4.0) or (6.0 <= h < 10.0)
+
+
+def token_cost(prompt, completion, cache_hit=0):
+    """按官方分档计价，返回美元。"""
+    prompt = int(prompt or 0)
+    completion = int(completion or 0)
+    hit = max(0, min(int(cache_hit or 0), prompt))
+    miss = prompt - hit
+    p_hit, p_miss, p_out = PRICE["peak" if is_peak() else "offpeak"]
+    return (hit * p_hit + miss * p_miss + completion * p_out) / 1e6
+
 # 基准尺寸（96 DPI 下的逻辑像素），实际窗口按屏幕与 DPI 自适应
 BASE_W, BASE_H = 760, 840
 MIN_W, MIN_H = 520, 560
@@ -345,6 +374,7 @@ class App:
         self.busy = False
         self.tok_in = 0          # 累计精确值（API usage）
         self.tok_out = 0
+        self.cost_usd = 0.0      # 累计花费（按官方分档价估算）
         self._tok_pending = 0    # 工作线程写入的已收字符数
         self._tok_shown = -1
         self._tok_live = False
@@ -1111,7 +1141,7 @@ class App:
                             self.ui_q.put(("delta", d))
                         if j.get("done"):
                             self.ui_q.put(("usage", (j.get("prompt_eval_count") or 0,
-                                                     j.get("eval_count") or 0)))
+                                                     j.get("eval_count") or 0, 0)))
                             break
             else:
                 if not DS_KEY:
@@ -1152,7 +1182,8 @@ class App:
                         u = j.get("usage")
                         if u:
                             self.ui_q.put(("usage", (u.get("prompt_tokens") or 0,
-                                                     u.get("completion_tokens") or 0)))
+                                                     u.get("completion_tokens") or 0,
+                                                     u.get("prompt_cache_hit_tokens") or 0)))
             self.ui_q.put(("done", acc))
         except urllib.error.HTTPError as e:
             body = e.read().decode("utf-8", "ignore")[:300]
@@ -1169,6 +1200,19 @@ class App:
             return "%.1fk" % (n / 1000.0)
         return str(n)
 
+    @staticmethod
+    def _fmt_cny(usd):
+        c = (usd or 0.0) * USD_CNY
+        if c <= 0:
+            return "\u00a50"
+        if c < 0.0001:
+            return "\u00a5<0.0001"
+        if c < 0.01:
+            return "\u00a5%.4f" % c
+        if c < 1:
+            return "\u00a5%.3f" % c
+        return "\u00a5%.2f" % c
+
     def _tok_show(self, inn=None, out=None):
         """流式只报输出（不编造输入数），结束后补 API 返回的精确 usage。"""
         if getattr(self, "tok_lbl", None) is None:
@@ -1180,9 +1224,10 @@ class App:
         if inn is None:
             inn, out = self.tok_in, self.tok_out
         self.tok_lbl.configure(
-            text="TOK  \u2191%s  \u2193%s  \u03a3%s"
+            text="TOK  \u2191%s  \u2193%s  \u03a3%s \u00b7 %s"
                  % (self._fmt_tok(inn), self._fmt_tok(out),
-                    self._fmt_tok(self.tok_in + self.tok_out)),
+                    self._fmt_tok(self.tok_in + self.tok_out),
+                    self._fmt_cny(self.cost_usd)),
             fg=MUTED)
 
     def _insert(self, s, tag):
@@ -1203,6 +1248,8 @@ class App:
                 elif kind == "usage":
                     self.tok_in += payload[0]
                     self.tok_out += payload[1]
+                    self.cost_usd += token_cost(payload[0], payload[1],
+                                                payload[2] if len(payload) > 2 else 0)
                     self._tok_live = False
                     self._tok_show(payload[0], payload[1])
                 elif kind == "done":

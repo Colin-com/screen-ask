@@ -9,6 +9,20 @@ sys.path.insert(0, str(ROOT))
 
 import screen_ask as sa
 
+# 打印每次计价明细（确认 cache hit 是否按官方分档扣）
+_orig_cost = sa.token_cost
+
+
+def _spy(prompt, completion, cache_hit=0):
+    usd = _orig_cost(prompt, completion, cache_hit)
+    print("   [usage] prompt=%d completion=%d cache_hit=%d -> ¥%.6f%s"
+          % (prompt, completion, cache_hit, usd * sa.USD_CNY,
+             " (PEAK)" if sa.is_peak() else ""))
+    return usd
+
+
+sa.token_cost = _spy
+
 sa.setup_dpi()
 root = tk.Tk()
 root.withdraw()
