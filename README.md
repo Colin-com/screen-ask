@@ -36,14 +36,14 @@ Screen Ask 把它压成一步：**按热键，浮窗已经在截图上方，直�
 
 **A. 一键（Windows）**
 
-1. 到 [Releases](../../releases) 下载 `screen-ask-<版本>.zip`
+1. 到 [Releases](https://github.com/Colin-com/screen-ask/releases) 下载 `screen-ask-<版本>.zip`
 2. 解压到任意目录
 3. 双击 `install.bat` —— 装 Pillow、生成 8-bit 图标、在桌面建快捷方式
 
 **B. 从源码**
 
 ```bash
-git clone <this-repo> && cd screen-ask
+git clone https://github.com/Colin-com/screen-ask && cd screen-ask
 pip install -r requirements.txt
 python install.ps1        # Windows：生成图标 + 桌面快捷方式
 python screen_ask.py      # 直接跑
