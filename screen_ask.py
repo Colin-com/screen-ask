@@ -25,7 +25,7 @@ from pathlib import Path
 import tkinter as tk
 from tkinter import font as tkfont
 
-from PIL import Image, ImageGrab, ImageTk
+from PIL import Image, ImageDraw, ImageGrab, ImageOps, ImageTk
 
 # ---------------------------------------------------------------- 平台
 
@@ -70,11 +70,13 @@ FONT_STACK_MONO = (
 
 SANS = "TkDefaultFont"
 MONO = "TkFixedFont"
+PIX = ""          # 点阵字体，仅用于纯 ASCII 标签
+PIX_SZ = 7        # 像素单位（负数），不随 DPI 缩放，保住点阵
 
 
 def init_fonts(root: tk.Misc) -> None:
     """按平台挑可用字体，避免硬编码 Consolas / 雅黑在别的系统上变方块。"""
-    global SANS, MONO
+    global SANS, MONO, PIX, PIX_SZ
     try:
         fams = {f.lower(): f for f in tkfont.families(root)}
     except Exception:
@@ -88,6 +90,12 @@ def init_fonts(root: tk.Misc) -> None:
 
     SANS = pick(FONT_STACK_SANS, "TkDefaultFont")
     MONO = pick(FONT_STACK_MONO, "TkFixedFont")
+    # 点阵字体：Windows 的 Terminal 原生 8x12，只有 8pt / -12px 才不被抗锯齿
+    pix = pick(("Terminal", "Fixedsys"), "")
+    if pix:
+        PIX, PIX_SZ = pix, -12
+    else:
+        PIX, PIX_SZ = MONO, 7
 
 
 def setup_dpi() -> None:
@@ -287,6 +295,43 @@ def grab_screen() -> Image.Image:
     return ImageGrab.grab()
 
 
+# ---------------------------------------------------------------- 8bit 渲染
+# 一帧的加工链：降采样 → 像素块 → 限色阶 → 扫描线。全部在 PIL 里做，
+# 尺寸压在取景器高度（几百像素），所以单帧只要十几毫秒。
+
+def pixelate(im: Image.Image, target_h: int, block: int = 2) -> Image.Image:
+    """先缩到 1/block 再放大回来 —— 得到硬边的方块像素，不是模糊插值。"""
+    tw = max(8, int(im.width * (target_h / im.height)))
+    th = max(8, target_h)
+    small = im.resize((max(1, tw // block), max(1, th // block)), Image.BILINEAR)
+    return small.resize((tw, th), Image.NEAREST)
+
+
+def draw_scanlines(im: Image.Image, phase: int = 0, gap: int = 3, alpha: int = 58) -> None:
+    d = ImageDraw.Draw(im, "RGBA")
+    start = (phase % gap) - gap
+    for y in range(start, im.height, gap):
+        d.line([(0, y), (im.width, y)], fill=(0, 0, 0, alpha))
+
+
+def crt_frame(im: Image.Image, target_h: int, block: int = 2,
+              reveal: float = 1.0, phase: int = 0, beam: bool = False) -> Image.Image:
+    p = pixelate(im, target_h, block)
+    p = ImageOps.posterize(p.convert("RGB"), 4)      # 每通道 4bit，8bit 调色板感
+    if reveal < 1.0:
+        cut = max(1, int(p.height * reveal))
+        mask = Image.new("RGB", p.size, (6, 6, 8))
+        mask.paste(p.crop((0, 0, p.width, cut)), (0, 0))
+        p = mask
+        if beam:
+            d = ImageDraw.Draw(p)
+            d.line([(0, cut - 1), (p.width, cut - 1)], fill=(255, 74, 28))
+            if cut > 3:
+                d.line([(0, cut - 3), (p.width, cut - 3)], fill=(120, 40, 16))
+    draw_scanlines(p, phase)
+    return p
+
+
 class App:
     def __init__(self, root: tk.Tk):
         self.root = root
@@ -299,12 +344,17 @@ class App:
         self.viewer = None
         self.busy = False
         self.photo = None
+        self.thumb_img = None
+        self._crt_base: Image.Image | None = None
+        self._crt_phase = 0
+        self._crt_on = True
         self.t0 = 0.0
         self.scale = ui_scale(root)
         self._build()
         start_hotkey(self.hk_q)
         self._warmup()
         root.after(50, self.poll)
+        root.after(400, self._crt_tick)
 
     # ---------------- 启动预热 ----------------
     def _warmup(self):
@@ -362,24 +412,24 @@ class App:
         bar.pack(fill="x")
         bar.pack_propagate(False)
 
-        tk.Label(bar, text="SCR-01", bg=PANEL, fg=DIM,
-                 font=(MONO, 8)).pack(side="left", padx=(14, 0))
+        tk.Label(bar, text="SCR-01", bg=PANEL, fg=MUTED,
+                 font=(PIX, PIX_SZ)).pack(side="left", padx=(14, 0))
         tk.Frame(bar, bg=LINE2, width=1, height=14).pack(side="left", padx=10, pady=12)
         tk.Label(bar, text="屏幕问答", bg=PANEL, fg=INK,
                  font=(SANS, 10, "bold")).pack(side="left")
 
         close = tk.Label(bar, text="✕", bg=PANEL, fg=DIM, font=(MONO, 10), cursor="hand2")
         close.pack(side="right", padx=(0, 14))
-        self.status = tk.Label(bar, text="READY", bg=PANEL, fg=DIM, font=(MONO, 8))
+        self.status = tk.Label(bar, text="READY", bg=PANEL, fg=MUTED, font=(PIX, PIX_SZ))
         self.status.pack(side="right", padx=(0, 16))
-        self.api_lbl = tk.Label(bar, text="API", bg=PANEL, fg=DIM, font=(MONO, 8), cursor="hand2")
+        self.api_lbl = tk.Label(bar, text="API", bg=PANEL, fg=MUTED, font=(PIX, PIX_SZ), cursor="hand2")
         self.api_lbl.pack(side="right", padx=(0, 16))
-        self.model_lbl = tk.Label(bar, text=self._model_text(), bg=PANEL, fg=DIM, font=(MONO, 8))
+        self.model_lbl = tk.Label(bar, text=self._model_text(), bg=PANEL, fg=MUTED, font=(PIX, PIX_SZ))
         self.model_lbl.pack(side="right", padx=(0, 16))
 
         self.api_lbl.bind("<Button-1>", lambda e: self._open_api_panel())
         self.api_lbl.bind("<Enter>", lambda e: self.api_lbl.configure(fg=ACCENT))
-        self.api_lbl.bind("<Leave>", lambda e: self.api_lbl.configure(fg=DIM))
+        self.api_lbl.bind("<Leave>", lambda e: self.api_lbl.configure(fg=MUTED))
         close.bind("<Button-1>", lambda e: self.hide())
         close.bind("<Enter>", lambda e: close.configure(fg=ACCENT))
         close.bind("<Leave>", lambda e: close.configure(fg=DIM))
@@ -391,7 +441,8 @@ class App:
         tk.Frame(shell, bg=LINE, height=1).pack(fill="x")
 
         # --- 取景器 ---
-        self.view = tk.Frame(shell, bg=SUNK, height=self.VIEW_H)
+        self.view = tk.Frame(shell, bg=SUNK, height=self.VIEW_H,
+                             highlightthickness=1, highlightbackground=LINE2)
         self.view.pack(fill="x")
         self.view.pack_propagate(False)
         self.thumb = tk.Label(self.view, bg=SUNK, bd=0, cursor="hand2")
@@ -400,12 +451,12 @@ class App:
 
         dw = tk.Frame(self.view, bg=LINE2)
         dw.place(x=10, y=10)
-        self.dim_tag = tk.Label(dw, text="—", bg=PANEL, fg=DIM, font=(MONO, 7), padx=7, pady=3)
+        self.dim_tag = tk.Label(dw, text="--", bg=PANEL, fg=MUTED, font=(PIX, PIX_SZ), padx=7, pady=3)
         self.dim_tag.pack(padx=1, pady=1)
 
         rw = tk.Frame(self.view, bg=LINE2)
         rw.place(relx=1.0, x=-10, y=10, anchor="ne")
-        self.recap = tk.Label(rw, text="RECAPTURE", bg=PANEL, fg=INK, font=(MONO, 7),
+        self.recap = tk.Label(rw, text="RECAPTURE", bg=PANEL, fg=INK, font=(PIX, PIX_SZ),
                               padx=7, pady=3, cursor="hand2")
         self.recap.pack(padx=1, pady=1)
         self.recap.bind("<Button-1>", lambda e: self.resnap())
@@ -420,11 +471,11 @@ class App:
                             padx=18, pady=4, spacing1=0, spacing2=2, spacing3=0,
                             insertbackground=ACCENT, cursor="arrow")
         self.text.pack(fill="both", expand=True)
-        self.text.tag_configure("you", font=(MONO, 8, "bold"), foreground=ACCENT, spacing1=16)
-        self.text.tag_configure("ai", font=(MONO, 8), foreground=DIM, spacing1=16)
+        self.text.tag_configure("you", font=(PIX, PIX_SZ), foreground=ACCENT, spacing1=16)
+        self.text.tag_configure("ai", font=(PIX, PIX_SZ), foreground=DIM, spacing1=16)
         self.text.tag_configure("body", font=(SANS, 10), foreground=INK,
                                 spacing1=4, spacing3=10, lmargin1=0, lmargin2=0)
-        self.text.tag_configure("meta", font=(MONO, 8), foreground=DIM, spacing3=10)
+        self.text.tag_configure("meta", font=(PIX, PIX_SZ), foreground=DIM, spacing3=10)
         self.text.tag_configure("err", font=(MONO, 8), foreground=ACCENT, spacing3=10)
         self.text.configure(state="disabled")
 
@@ -448,14 +499,14 @@ class App:
         btnwrap = tk.Frame(foot, bg=LINE2)
         btnwrap.pack(side="right", padx=(8, 18), pady=(10, 0), anchor="n")
         self.send_btn = tk.Label(btnwrap, text="SEND", bg=PANEL, fg=INK,
-                                 font=(MONO, 9, "bold"), padx=16, pady=8, cursor="hand2")
+                                 font=(PIX, -12), padx=20, pady=9, cursor="hand2")
         self.send_btn.pack(padx=1, pady=1)
         self.send_btn.bind("<Button-1>", lambda e: self._on_send())
         self.send_btn.bind("<Enter>", lambda e: self._btn_hover(True))
         self.send_btn.bind("<Leave>", lambda e: self._btn_hover(False))
 
         tk.Label(foot, text="ENTER SEND    ESC HIDE    ^R RECAP", bg=PANEL, fg=DIM,
-                 font=(MONO, 7)).pack(side="bottom", anchor="w", padx=18, pady=(0, 10))
+                 font=(PIX, -12)).pack(side="bottom", anchor="w", padx=18, pady=(0, 10))
 
         win.bind("<Escape>", lambda e: (self._close_panel() if self.panel else self.hide()))
         win.bind("<Control-r>", lambda e: self.resnap())
@@ -525,14 +576,14 @@ class App:
         head = tk.Frame(inner, bg=PANEL, height=34)
         head.pack(fill="x")
         head.pack_propagate(False)
-        tk.Label(head, text="VIEWER", bg=PANEL, fg=DIM, font=(MONO, 8)).pack(side="left", padx=(14, 0))
-        tk.Label(head, text="%d × %d" % im.size, bg=PANEL, fg=DIM,
-                 font=(MONO, 8)).pack(side="left", padx=12)
-        zoom_lbl = tk.Label(head, text="FIT", bg=PANEL, fg=DIM, font=(MONO, 8))
+        tk.Label(head, text="VIEWER", bg=PANEL, fg=DIM, font=(PIX, PIX_SZ)).pack(side="left", padx=(14, 0))
+        tk.Label(head, text="%d x %d" % im.size, bg=PANEL, fg=DIM,
+                 font=(PIX, PIX_SZ)).pack(side="left", padx=12)
+        zoom_lbl = tk.Label(head, text="FIT", bg=PANEL, fg=DIM, font=(PIX, PIX_SZ))
         zoom_lbl.pack(side="right", padx=(0, 14))
         if vw >= 900:
-            tk.Label(head, text="SCROLL ZOOM · DRAG PAN · DBLCLICK FIT", bg=PANEL, fg=LINE2,
-                     font=(MONO, 7)).pack(side="right", padx=(0, 12))
+            tk.Label(head, text="SCROLL ZOOM / DRAG PAN / DBLCLICK FIT", bg=PANEL, fg=LINE2,
+                     font=(PIX, -12)).pack(side="right", padx=(0, 12))
         cls = tk.Label(head, text="✕", bg=PANEL, fg=DIM, font=(MONO, 10), cursor="hand2")
         cls.pack(side="right", padx=(0, 10))
         cls.bind("<Button-1>", lambda e: top.destroy())
@@ -676,7 +727,7 @@ class App:
         head = tk.Frame(p, bg=PANEL, height=38)
         head.pack(fill="x")
         head.pack_propagate(False)
-        tk.Label(head, text="CONFIG", bg=PANEL, fg=DIM, font=(MONO, 8)).pack(side="left", padx=(14, 0))
+        tk.Label(head, text="CONFIG", bg=PANEL, fg=DIM, font=(PIX, PIX_SZ)).pack(side="left", padx=(14, 0))
         tk.Frame(head, bg=LINE2, width=1, height=14).pack(side="left", padx=10, pady=12)
         tk.Label(head, text="接口设置", bg=PANEL, fg=INK,
                  font=(SANS, 10, "bold")).pack(side="left")
@@ -694,14 +745,14 @@ class App:
                              bg=PANEL, fg=DIM, font=(MONO, 7))
         self.pmsg.pack(side="left")
         applyb = tk.Label(row, text="APPLY", bg=ACCENT, fg="#0b0b0d",
-                          font=(MONO, 9, "bold"), padx=18, pady=6, cursor="hand2")
+                          font=(PIX, -12), padx=20, pady=7, cursor="hand2")
         applyb.pack(side="right")
         applyb.bind("<Button-1>", lambda e: self._apply_config())
 
         body = tk.Frame(p, bg=BG)
         body.pack(fill="both", expand=True, padx=18, pady=16)
 
-        tk.Label(body, text="PROVIDER", bg=BG, fg=DIM, font=(MONO, 7)).pack(anchor="w")
+        tk.Label(body, text="PROVIDER", bg=BG, fg=DIM, font=(PIX, -12)).pack(anchor="w")
         tabs = tk.Frame(body, bg=BG)
         tabs.pack(anchor="w", pady=(6, 18))
         self.pv = tk.StringVar(value=PROVIDER)
@@ -709,14 +760,14 @@ class App:
         for key, txt in (("ollama", "OLLAMA  本地"), ("deepseek", "DEEPSEEK  云端")):
             holder = tk.Frame(tabs, bg=LINE2)
             holder.pack(side="left", padx=(0, 8))
-            lb = tk.Label(holder, text=txt, bg=PANEL, fg=DIM, font=(MONO, 8),
+            lb = tk.Label(holder, text=txt, bg=PANEL, fg=DIM, font=(PIX, PIX_SZ),
                           padx=12, pady=6, cursor="hand2")
             lb.pack(padx=1, pady=1)
             lb.bind("<Button-1>", lambda e, k=key: self._pick_provider(k))
             self.tab_map[key] = lb
 
         def field(label, default, show=None):
-            tk.Label(body, text=label, bg=BG, fg=DIM, font=(MONO, 7)).pack(anchor="w", pady=(0, 4))
+            tk.Label(body, text=label, bg=BG, fg=DIM, font=(PIX, -12)).pack(anchor="w", pady=(0, 4))
             wrap = tk.Frame(body, bg=LINE)
             wrap.pack(fill="x", pady=(0, 14))
             e = tk.Entry(wrap, bg=PANEL, fg=INK, bd=0, highlightthickness=0,
@@ -833,20 +884,125 @@ class App:
             return
         self.full_img = img
         self.messages = []
-        self.dim_tag.configure(text="%d × %d" % size)
+        self.dim_tag.configure(text="%d x %d" % size)
 
-        vw, vh = max(100, self.W - 2), max(100, self.VIEW_H)
-        ratio = min(vw / img.width, vh / img.height)
-        nw, nh = max(1, int(img.width * ratio)), max(1, int(img.height * ratio))
-        disp = img.resize((nw, nh), Image.LANCZOS)
-        self.photo = ImageTk.PhotoImage(disp)
-        self.thumb.configure(image=self.photo)
         self.clear_chat()
         self.set_status("READY", DIM)
         self._ph_set()
         self.entry.focus_set()
         self.win.deiconify()
         self.win.lift()
+        self._scan_in(img)
+
+    # ---------------- 8bit 渲染管道 ----------------
+    def _paint(self, pim):
+        """把一张已经加工好的 PIL 图贴进取景器（唯一碰 ImageTk 的地方）。"""
+        ph = ImageTk.PhotoImage(pim)
+        self.thumb.configure(image=ph)
+        self.thumb_img = ph
+
+    def _scan_in(self, img, steps=9, interval=40):
+        """CRT 接入：画面按行从上往下扫出来，扫到底再叠扫描线。"""
+        base = crt_frame(img, self.VIEW_H, block=2)
+        self._crt_base = base
+        self._crt_phase = 0
+        w, h = base.size
+
+        def step(i):
+            if i > steps:
+                self._paint(base)
+                return
+            cut = max(2, int(h * i / steps))
+            frame = Image.new("RGB", base.size, (6, 6, 8))
+            frame.paste(base.crop((0, 0, w, cut)), (0, 0))
+            d = ImageDraw.Draw(frame)
+            d.line([(0, cut - 1), (w, cut - 1)], fill=(255, 74, 28))
+            if cut > 4:
+                d.line([(0, cut - 4), (w, cut - 4)], fill=(110, 36, 14))
+            self._paint(frame)
+            self.root.after(interval, lambda: step(i + 1))
+
+        step(1)
+
+    def _crt_tick(self):
+        """静态时扫描线缓慢下移——画面是「活的」，但不重新解码整张图。"""
+        if (self._crt_on and self._crt_base is not None
+                and self.win.winfo_viewable() and not self.busy):
+            self._crt_phase = (self._crt_phase + 1) % 3
+            frame = self._crt_base.copy()
+            draw_scanlines(frame, self._crt_phase)
+            self._paint(frame)
+        self.root.after(190, self._crt_tick)
+
+    # ---------------- 开机动画 ----------------
+    def boot_then_capture(self):
+        self.win.deiconify()
+        self.win.lift()
+        self.boot_anim(lambda: self.capture_and_show())
+
+    def boot_anim(self, done):
+        cover = tk.Frame(self.win, bg=BG)
+        cover.place(x=0, y=0, relwidth=1, relheight=1)
+        t = tk.Text(cover, bg=BG, fg=MUTED, bd=0, highlightthickness=0,
+                    font=(PIX, -12), padx=26, pady=22, spacing1=3, spacing3=3,
+                    cursor="arrow")
+        t.pack(fill="both", expand=True)
+        t.configure(state="disabled")
+        t.tag_configure("hdr", foreground=ACCENT, font=(PIX, -12))
+        t.tag_configure("dim", foreground=LINE2, font=(PIX, -12))
+        t.tag_configure("ok", foreground=DIM, font=(PIX, -12))
+        t.tag_configure("bar", foreground=ACCENT)
+
+        rows = [
+            ("SCR-01 // SCREEN ASK", "hdr"),
+            ("8-bit capture console  v0.3", "dim"),
+            ("", None),
+            ("> display ....... %d x %d @ %d%%" % (
+                self.root.winfo_screenwidth(), self.root.winfo_screenheight(),
+                round(self.scale * 100)), "ok"),
+            ("> fonts ......... %s / %s" % (SANS, MONO), "ok"),
+            ("> provider ...... %s" % PROVIDER, "ok"),
+            ("> model ......... %s" % MODEL_LABEL, "ok"),
+            ("> hotkey ........ %s" % HOTKEY_SPEC, "ok"),
+            ("> pipeline ...... 8BIT / CRT / SCAN", "ok"),
+            ("", None),
+        ]
+
+        state = {"i": 0}
+
+        def tick():
+            i = state["i"]
+            if i < len(rows):
+                txt, tag = rows[i]
+                t.configure(state="normal")
+                if tag:
+                    t.insert("end", txt + "\n", tag)
+                else:
+                    t.insert("end", "\n")
+                if i >= 3:
+                    t.insert("end", "", "bar")
+                t.see("end")
+                t.configure(state="disabled")
+                state["i"] = i + 1
+                self.root.after(58 if txt else 26, tick)
+                return
+            # 进度条 + READY 闪烁
+            t.configure(state="normal")
+            for k in range(18):
+                t.insert("end", "█", "bar")
+            t.insert("end", "\n\n", "bar")
+            t.insert("end", "[ FRAMEBUFFER OK ]  READY", "hdr")
+            t.configure(state="disabled")
+            self.root.after(420, finish)
+
+        def finish():
+            try:
+                cover.destroy()
+            except Exception:
+                pass
+            done()
+
+        self.root.after(90, tick)
 
     def clear_chat(self):
         self.text.configure(state="normal")
@@ -1037,7 +1193,7 @@ def main():
     init_fonts(root)
     log("--- start %s | provider=%s model=%s ---" % (sys.platform, PROVIDER, MODEL_LABEL))
     app = App(root)
-    root.after(600, app.resnap)
+    root.after(120, app.boot_then_capture)
     root.mainloop()
 
 
