@@ -471,6 +471,901 @@ def crt_frame(im: Image.Image, target_h: int, block: int = 2,
     return p
 
 
+# ---------------------------------------------------------------- LaTeX 公式渲染
+# 极简 TeX 子集 -> Pillow 图像（零 TeX 依赖），供聊天框把公式渲染成图片。
+# 覆盖：上下标 / frac / sqrt / 希腊 / 运算符 / sum·int 上下限 / left-right /
+#       矩阵·cases / text·mathrm / hat·vec·overline。失败一律回退原文。
+
+import re
+from PIL import Image as _PILImage, ImageDraw as _PILDraw, ImageFont
+
+SS = 3  # 超采样倍数
+
+def _resolve(cands):
+    for path, idx in cands:
+        try:
+            if Path(path).exists():
+                return (path, idx)
+        except Exception:
+            pass
+    return None
+
+
+_FONT_CANDS = {
+    "math": [
+        ("C:/Windows/Fonts/cambria.ttc", 1),
+        ("/System/Library/Fonts/Supplemental/STIXTwoMath.otf", 0),
+        ("/usr/share/fonts/truetype/dejavu/DejaVuSerif.ttf", 0),
+        ("/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf", 0),
+    ],
+    "serif": [
+        ("C:/Windows/Fonts/cambria.ttc", 0),
+        ("C:/Windows/Fonts/times.ttf", 0),
+        ("/System/Library/Fonts/Times.ttc", 0),
+        ("/usr/share/fonts/truetype/dejavu/DejaVuSerif.ttf", 0),
+    ],
+    "cjk": [
+        ("C:/Windows/Fonts/msyh.ttc", 0),
+        ("C:/Windows/Fonts/simhei.ttf", 0),
+        ("/System/Library/Fonts/PingFang.ttc", 0),
+        ("/usr/share/fonts/opentype/noto/NotoSansCJK-Regular.ttc", 0),
+        ("/usr/share/fonts/truetype/wqy/wqy-microhei.ttc", 0),
+    ],
+}
+
+F_MATH = _resolve(_FONT_CANDS["math"])
+F_SERIF = _resolve(_FONT_CANDS["serif"]) or F_MATH
+F_CJK = _resolve(_FONT_CANDS["cjk"]) or F_SERIF
+F_SYM = F_MATH
+
+_fcache: dict = {}
+
+
+def _font(kind, size):
+    size = max(4, int(round(size)))
+    key = (kind, size)
+    f = _fcache.get(key)
+    if f is None:
+        path, idx = kind
+        try:
+            f = ImageFont.truetype(path, size, index=idx)
+        except Exception:
+            f = ImageFont.truetype(path, size)
+        _fcache[key] = f
+    return f
+
+
+def _mk(w, h):
+    return _PILImage.new("L", (max(1, int(round(w))), max(1, int(round(h)))), 0)
+
+
+# --------------------------------------------------------------------------
+# 原子 Box
+# --------------------------------------------------------------------------
+def textbox(s, size, kind=F_MATH, dy=0.0):
+    """基线左对齐渲染一段文本 -> Box。dy 为基础位移（正=上移）。"""
+    if not s:
+        return (_mk(1, 1), 0.0, 1.0, 0.0)
+    f = _font(kind, size)
+    try:
+        x0, y0, x1, y1 = f.getbbox(s, anchor="ls")
+    except Exception:
+        x0, y0, x1, y1 = f.getbbox(s)
+    w = max(1.0, x1 - x0)
+    h = max(1.0, y1 - y0)
+    img = _mk(w, h)
+    _PILDraw.Draw(img).text((-x0, -y0), s, font=f, fill=255, anchor="ls")
+    return (img, w, h, -y0 + dy)
+
+
+def hcat(boxes):
+    """水平拼接，基线对齐。"""
+    boxes = [b for b in boxes if b is not None]
+    if not boxes:
+        return (_mk(1, 1), 0.0, 1.0, 0.0)
+    asc = max(b[3] for b in boxes)
+    desc = max(b[2] - b[3] for b in boxes)
+    W = sum(b[1] for b in boxes)
+    H = asc + desc
+    img = _mk(W, H)
+    x = 0.0
+    for m, w, h, a in boxes:
+        img.paste(m, (int(round(x)), int(round(asc - a))), m)
+        x += w
+    return (img, W, H, asc)
+
+
+def vcat(boxes, gap=0.0, align="center"):
+    """垂直堆叠（align: center/left/right）。"""
+    boxes = [b for b in boxes if b is not None]
+    if not boxes:
+        return (_mk(1, 1), 0.0, 1.0, 0.0)
+    W = max(b[1] for b in boxes)
+    H = sum(b[2] for b in boxes) + gap * (len(boxes) - 1)
+    img = _mk(W, H)
+    y = 0.0
+    for m, w, h, a in boxes:
+        dx = 0.0 if align == "left" else (W - w if align == "right" else (W - w) / 2.0)
+        img.paste(m, (int(round(dx)), int(round(y))), m)
+        y += h + gap
+    return (img, W, H, boxes[0][3])
+
+
+def shift(box, dy):
+    """正 dy = 基线上移；只改 asc，画布不动，hcat 会正确对齐。"""
+    img, w, h, asc = box
+    return (img, w, h, asc + dy)
+
+
+def pad(box, l=0.0, r=0.0, t=0.0, b=0.0):
+    img, w, h, asc = box
+    out = _mk(w + l + r, h + t + b)
+    out.paste(img, (int(round(l)), int(round(t))), img)
+    return (out, w + l + r, h + t + b, asc + t)
+
+
+def scale_box(box, k):
+    img, w, h, asc = box
+    if k == 1.0:
+        return box
+    nw, nh = max(1, int(round(w * k))), max(1, int(round(h * k)))
+    return (img.resize((nw, nh), _PILImage.LANCZOS), float(nw), float(nh), asc * k)
+
+
+# --------------------------------------------------------------------------
+# 符号表
+# --------------------------------------------------------------------------
+GREEK = {
+    "alpha": "\u03b1", "beta": "\u03b2", "gamma": "\u03b3", "delta": "\u03b4",
+    "epsilon": "\u03f5", "varepsilon": "\u03b5", "zeta": "\u03b6", "eta": "\u03b7",
+    "theta": "\u03b8", "vartheta": "\u03d1", "iota": "\u03b9", "kappa": "\u03ba",
+    "lambda": "\u03bb", "mu": "\u03bc", "nu": "\u03bd", "xi": "\u03be",
+    "pi": "\u03c0", "varpi": "\u03d6", "rho": "\u03c1", "varrho": "\u03f1",
+    "sigma": "\u03c3", "varsigma": "\u03c2", "tau": "\u03c4", "upsilon": "\u03c5",
+    "phi": "\u03d5", "varphi": "\u03c6", "chi": "\u03c7", "psi": "\u03c8",
+    "omega": "\u03c9",
+    "Gamma": "\u0393", "Delta": "\u0394", "Theta": "\u0398", "Lambda": "\u039b",
+    "Xi": "\u039e", "Pi": "\u03a0", "Sigma": "\u03a3", "Upsilon": "\u03a5",
+    "Phi": "\u03a6", "Psi": "\u03a8", "Omega": "\u03a9",
+}
+
+SYM = {
+    "cdot": "\u00b7", "times": "\u00d7", "div": "\u00f7", "pm": "\u00b1",
+    "mp": "\u2213", "le": "\u2264", "leq": "\u2264", "ge": "\u2265", "geq": "\u2265",
+    "ne": "\u2260", "neq": "\u2260", "approx": "\u2248", "equiv": "\u2261",
+    "sim": "\u223c", "simeq": "\u2243", "propto": "\u221d", "infty": "\u221e",
+    "partial": "\u2202", "nabla": "\u2207", "angle": "\u2220", "perp": "\u22a5",
+    "parallel": "\u2225", "circ": "\u2218", "bullet": "\u2219", "ast": "\u2217",
+    "to": "\u2192", "rightarrow": "\u2192", "leftarrow": "\u2190",
+    "Rightarrow": "\u21d2", "Leftarrow": "\u21d0", "leftrightarrow": "\u2194",
+    "Leftrightarrow": "\u21d4", "mapsto": "\u21a6", "uparrow": "\u2191",
+    "downarrow": "\u2193", "in": "\u2208", "notin": "\u2209", "subset": "\u2282",
+    "subseteq": "\u2286", "supset": "\u2283", "cup": "\u222a", "cap": "\u2229",
+    "emptyset": "\u2205", "forall": "\u2200", "exists": "\u2203", "neg": "\u00ac",
+    "land": "\u2227", "lor": "\u2228", "wedge": "\u2227", "vee": "\u2228",
+    "oplus": "\u2295", "otimes": "\u2297", "sum": "\u2211", "prod": "\u220f",
+    "int": "\u222b", "iint": "\u222c", "iiint": "\u222d", "oint": "\u222e",
+    "sqrt": "\u221a", "ldots": "\u2026", "dots": "\u2026", "cdots": "\u22ef",
+    "vdots": "\u22ee", "ddots": "\u22f1", "prime": "\u2032", "degree": "\u00b0",
+    "hbar": "\u210f", "ell": "\u2113", "aleph": "\u2135", "Re": "\u211c", "Im": "\u2111",
+    "langle": "\u27e8", "rangle": "\u27e9", "mid": "\u2223", "vert": "|",
+    "Vert": "\u2016", "triangle": "\u25b3", "square": "\u25a1",
+    "because": "\u2235", "therefore": "\u2234", "dagger": "\u2020",
+    "pmb": "\u00b1", "star": "\u22c6", "setminus": "\u2216",
+}
+
+SPACES = {",": 0.17, ":": 0.22, ";": 0.28, "!": -0.17, " ": 0.25,
+          "quad": 0.9, "qquad": 1.8, "enspace": 0.5, "thinspace": 0.18}
+
+FUNCS = {"sin", "cos", "tan", "cot", "sec", "csc", "arcsin", "arccos", "arctan",
+         "sinh", "cosh", "tanh", "log", "ln", "lg", "exp", "lim", "max", "min",
+         "sup", "inf", "det", "dim", "ker", "gcd", "deg", "arg", "Pr", "mod"}
+
+BIGOPS = {"sum", "prod", "int", "iint", "iiint", "oint", "lim", "bigcup", "bigcap"}
+INTEGRALS = {"int", "iint", "iiint", "oint"}
+
+DELIMS = {"(": "(", ")": ")", "[": "[", "]": "]", "\\{": "{", "\\}": "}",
+          "|": "|", "\\|": "\u2016", ".": None, "\\langle": "\u27e8",
+          "\\rangle": "\u27e9", "\\lvert": "|", "\\rvert": "|"}
+
+MATRIX_ENVS = {"matrix", "pmatrix", "bmatrix", "vmatrix", "Bmatrix", "cases",
+               "aligned", "array"}
+
+
+# --------------------------------------------------------------------------
+# 词法
+# --------------------------------------------------------------------------
+TOK_RE = re.compile(r"\\[a-zA-Z]+\*?|\\\\|\\[^a-zA-Z]|\\.|\d+(?:\.\d+)?|\s+|.", re.S)
+
+
+def tokenize(s):
+    return TOK_RE.findall(s)
+
+
+# --------------------------------------------------------------------------
+# 语法 -> 节点树
+# --------------------------------------------------------------------------
+class P:
+    def __init__(self, toks):
+        self.t = toks
+        self.i = 0
+
+    def peek(self, k=0):
+        j = self.i + k
+        return self.t[j] if j < len(self.t) else None
+
+    def next(self):
+        v = self.peek()
+        self.i += 1
+        return v
+
+    def parse(self, stop=()):
+        """解析到 } / \right / \end / $ 之类停止符。"""
+        out = []
+        while True:
+            tk = self.peek()
+            if tk is None:
+                break
+            if tk in stop:
+                break
+            if tk in ("}", "\\right", "\\end", "$", "$$"):
+                break
+            node = self.parse_one()
+            if node is not None:
+                out.append(node)
+        return out
+
+    # 读一个参数：{...} 或多个 token
+    def arg(self):
+        tk = self.peek()
+        if tk is None:
+            return []
+        if tk == "{":
+            self.next()
+            inner = self.parse(stop=("}",))
+            if self.peek() == "}":
+                self.next()
+            return inner
+        if tk == "\\":  # 防呆
+            self.next()
+            return []
+        node = self.parse_one()
+        return [node] if node else []
+
+    def parse_one(self):
+        tk = self.next()
+        if tk is None:
+            return None
+        if tk == "{":
+            inner = self.parse(stop=("}",))
+            if self.peek() == "}":
+                self.next()
+            return ("grp", inner)
+        if tk == "}":
+            return None
+        if tk == "^":
+            return ("sup", self.arg())
+        if tk == "_":
+            return ("sub", self.arg())
+        if tk == "&":
+            return ("amp",)
+        if tk in ("\\\\", "\\cr"):
+            return ("newline",)
+        if tk.startswith("\\"):
+            return self.command(tk)
+        if tk.isspace():
+            return ("space", 0.22)
+        return ("ch", tk)
+
+    def command(self, tk):
+        name = tk[1:]
+        # 手工处理 \left ... \right
+        if name == "left":
+            ld = self.delim_tok()
+            inner = self.parse(stop=("\\right",))
+            rd = None
+            if self.peek() == "\\right":
+                self.next()
+                rd = self.delim_tok()
+            return ("delim", ld, rd, inner)
+        if name in ("text", "textrm", "mbox", "textbf", "textit"):
+            return ("text", self.raw_arg())
+        if name in ("mathrm", "operatorname", "rm"):
+            return ("grp_rm", self.arg())
+        if name in ("mathbf", "bf", "boldsymbol", "bm"):
+            return ("grp_bf", self.arg())
+        if name in ("mathit", "it"):
+            return ("grp_it", self.arg())
+        if name in ("frac", "dfrac", "tfrac", "cfrac"):
+            num = self.arg()
+            den = self.arg()
+            return ("frac", num, den)
+        if name == "binom":
+            return ("binom", self.arg(), self.arg())
+        if name == "sqrt":
+            idx = None
+            if self.peek() == "[":
+                self.next()
+                idx = self.parse(stop=("[", "]"))
+                if self.peek() == "]":
+                    self.next()
+            return ("sqrt", idx, self.arg())
+        if name in ("hat", "widehat", "bar", "overline", "vec", "dot", "ddot", "tilde", "underline", "overbrace", "underbrace"):
+            return ("accent", name, self.arg())
+        if name in ("begin",):
+            env = self.raw_arg().strip()
+            body = self.parse(stop=("\\end",))
+            if self.peek() == "\\end":
+                self.next()
+                self.raw_arg()
+            return ("matrix", env, body)
+        if name in GREEK:
+            return ("ch", GREEK[name])
+        if name in SYM:
+            if name == "sqrt":
+                return ("ch", "\u221a")
+            return ("ch", SYM[name])
+        if name in FUNCS:
+            return ("fn", name)
+        if name in BIGOPS:
+            return ("bigop", name)
+        if name in SPACES:
+            return ("space", SPACES[name] * 1.0)
+        if name in ("displaystyle", "textstyle", "limits", "nolimits", "left.", "nonumber"):
+            return None
+        if name in ("quad", "qquad"):
+            return ("space", SPACES[name])
+        if len(name) == 1:
+            # \, \; \! \% \$ \# \& \_ \{ \}
+            if name in SPACES:
+                return ("space", SPACES[name] * 1.0)
+            if name in ("(", ")"):
+                return None
+            return ("ch", name)
+        return ("ch", name)  # 未知命令按正体文字处理，避免丢字
+
+    def raw_arg(self):
+        if self.peek() != "{":
+            tk = self.next()
+            return tk or ""
+        self.next()
+        depth = 1
+        buf = []
+        while True:
+            tk = self.peek()
+            if tk is None:
+                break
+            self.next()
+            if tk == "{":
+                depth += 1
+            elif tk == "}":
+                depth -= 1
+                if depth == 0:
+                    break
+            buf.append(tk)
+        return "".join(buf)
+
+    def delim_tok(self):
+        tk = self.peek()
+        if tk is None:
+            return None
+        self.next()
+        d = DELIMS.get(tk)
+        if d is None and tk.startswith("\\"):
+            d = SYM.get(tk[1:], tk[1:])
+        return d
+
+
+# --------------------------------------------------------------------------
+# 排版
+# --------------------------------------------------------------------------
+def layout(nodes, size, style="math"):
+    """节点列表 -> Box。style: math / rm / bf / it"""
+    boxes = []
+    i = 0
+    nodes = [n for n in nodes if n is not None]
+    while i < len(nodes):
+        n = nodes[i]
+        kind = n[0]
+        nxt = nodes[i + 1] if i + 1 < len(nodes) else None
+
+        if kind == "ch":
+            s = n[1]
+            kind_font = F_SERIF if style in ("rm", "bf") else F_MATH
+            b = textbox(s, size, kind_font)
+            boxes.append(b)
+            i += 1
+
+        elif kind in ("grp", "grp_rm", "grp_bf", "grp_it"):
+            st = {"grp": style, "grp_rm": "rm", "grp_bf": "bf", "grp_it": "it"}[kind]
+            boxes.append(layout(n[1], size, st))
+            i += 1
+
+        elif kind == "text":
+            boxes.append(textbox(n[1], size, F_CJK if _has_cjk(n[1]) else F_SERIF))
+            i += 1
+
+        elif kind == "fn":
+            boxes.append(textbox(n[1], size, F_SERIF))
+            i += 1
+
+        elif kind == "space":
+            boxes.append((_mk(1, 1), max(0.0, n[1] * size), 1.0, 0.0))
+            i += 1
+
+        elif kind in ("sup", "sub"):
+            base = boxes.pop() if boxes else (_mk(1, 1), 0.0, 1.0, 0.0)
+            sup = sub = None
+            j = i
+            while j < len(nodes) and nodes[j][0] in ("sup", "sub"):
+                if nodes[j][0] == "sup":
+                    sup = nodes[j][1]
+                else:
+                    sub = nodes[j][1]
+                j += 1
+            boxes.append(_scripts(base, sup, sub, size))
+            i = j
+
+        elif kind == "frac":
+            boxes.append(_frac(n[1], n[2], size))
+            i += 1
+
+        elif kind == "binom":
+            boxes.append(_binom(n[1], n[2], size))
+            i += 1
+
+        elif kind == "sqrt":
+            boxes.append(_sqrt(n[1], n[2], size))
+            i += 1
+
+        elif kind == "accent":
+            boxes.append(_accent(n[1], n[2], size))
+            i += 1
+
+        elif kind == "delim":
+            inner = layout(n[3], size, style)
+            boxes.append(_delim(n[1], n[2], inner, size))
+            i += 1
+
+        elif kind == "bigop":
+            name = n[1]
+            # 紧跟的 ^ _ 作为上下限
+            sup = sub = None
+            j = i + 1
+            while j < len(nodes) and nodes[j][0] in ("sup", "sub"):
+                if nodes[j][0] == "sup":
+                    sup = nodes[j][1]
+                else:
+                    sub = nodes[j][1]
+                j += 1
+            boxes.append(_bigop(name, sup, sub, size))
+            i = j
+
+        elif kind == "matrix":
+            boxes.append(_matrix(n[1], n[2], size))
+            i += 1
+
+        elif kind == "newline":
+            boxes.append((_mk(1, 1), 0.0, size * 0.6, size * 0.45))
+            i += 1
+
+        else:
+            i += 1
+    return hcat(boxes)
+
+
+def _has_cjk(s):
+    return any("\u4e00" <= c <= "\u9fff" for c in s)
+
+
+def _scripts(base, sup, sub, size):
+    ss = max(size * 0.72, 8.0)
+    parts = [base]
+    if sup is not None:
+        sb = shift(layout(sup, ss), size * 0.44)
+        parts.append(sb)
+    if sub is not None:
+        db = shift(layout(sub, ss), -size * 0.20)
+        parts.append(db)
+    return hcat(parts)
+
+
+def _frac(num, den, size):
+    sub = max(size * 0.85, 8.5)          # 嵌套分式别缩到看不清
+    nb = layout(num, sub)
+    db = layout(den, sub)
+    W = max(nb[1], db[1]) + size * 0.10
+    gap = size * 0.15
+    lw = max(2, int(round(size * 0.065)))
+    axis = size * 0.28                     # 分数线在基线上方
+    H = nb[2] + gap + lw + gap + db[2]
+    img = _mk(W, H)
+    img.paste(nb[0], (int((W - nb[1]) / 2), 0), nb[0])
+    y = nb[2] + gap
+    _PILDraw.Draw(img).rectangle([0, y, W - 1, y + lw - 1], fill=255)
+    img.paste(db[0], (int((W - db[1]) / 2), int(y + lw + gap)), db[0])
+    return (img, W, H, y + lw / 2 + axis)
+
+
+def _binom(a, b, size):
+    inner = _frac(a, b, size * 1.02)
+    return _delim("(", ")", inner, size, pad_k=0.12)
+
+
+def _sqrt(idx, body, size):
+    inner = layout(body, size)
+    if idx:
+        ib = layout(idx, size * 0.5)
+        ib = shift(ib, inner[2] * 0.55)
+    else:
+        ib = (_mk(1, 1), 0.0, 0.0, 0.0)
+    h = inner[2]
+    t = max(2, int(round(size * 0.062)))
+    ww = size * 0.62
+    img = _mk(ww + inner[1] + size * 0.12 + ib[1], h + t + size * 0.06)
+    d = _PILDraw.Draw(img)
+    y0 = t + size * 0.02
+    xoff = ib[1]
+    pts = [(xoff + ww * 0.02, y0 + h * 0.62),
+           (xoff + ww * 0.26, y0 + h * 0.52),
+           (xoff + ww * 0.44, y0 + h * 0.98),
+           (xoff + ww * 0.98, y0 + t * 0.5)]
+    d.line(pts, fill=255, width=t, joint="curve")
+    d.line([(xoff + ww * 0.95, y0 + t * 0.5), (img.size[0] - 1, y0 + t * 0.5)],
+           fill=255, width=t)
+    img.paste(inner[0], (int(xoff + ww + size * 0.10), int(y0 + t * 0.7)), inner[0])
+    if idx:
+        img.paste(ib[0], (0, int(y0 + h * 0.15 - ib[3])), ib[0])
+    asc = t + size * 0.06 + inner[3]
+    return (img, float(img.size[0]), float(img.size[1]), asc)
+
+
+def _accent(kind, body, size):
+    b = layout(body, size)
+    t = max(1, int(round(size * 0.055)))
+    if kind in ("bar", "overline"):
+        return hcat([b]) if False else _overline(b, t, size)
+    if kind == "underline":
+        img, w, h, asc = b
+        out = _mk(w, h + size * 0.16)
+        out.paste(img, (0, 0), img)
+        d = _PILDraw.Draw(out)
+        y = min(out.size[1] - 1, int(asc + size * 0.10))
+        d.rectangle([0, y, w - 1, y + t - 1], fill=255)
+        return (out, w, out.size[1], asc)
+    if kind in ("hat", "widehat"):
+        return _hat(b, size, "hat")
+    if kind == "tilde":
+        return _hat(b, size, "tilde")
+    if kind == "vec":
+        return _hat(b, size, "vec")
+    if kind in ("dot", "ddot"):
+        return _hat(b, size, kind)
+    if kind in ("overbrace", "underbrace"):
+        return _over(b, "\u23de", size, scale=max(1.0, b[1] / size))
+    return b
+
+
+def _overline(b, t, size):
+    img, w, h, asc = b
+    out = _mk(w, h + t + size * 0.06)
+    out.paste(img, (0, int(t + size * 0.06)), img)
+    d = _PILDraw.Draw(out)
+    d.rectangle([0, 0, w - 1, t - 1], fill=255)
+    return (out, w, out.size[1], asc + t + size * 0.06)
+
+
+def _hat(b, size, kind):
+    img, w, h, asc = b
+    t = max(1, int(round(size * 0.055)))
+    hh = size * 0.34
+    H = h + hh
+    out = _mk(w, H)
+    out.paste(img, (0, int(hh)), img)
+    d = _PILDraw.Draw(out)
+    mx = w * 0.5
+    mw = min(w * 0.62, size * 0.85)
+    if kind in ("hat", "widehat"):
+        d.line([(mx - mw / 2, hh * 0.85), (mx, hh * 0.12), (mx + mw / 2, hh * 0.85)],
+               fill=255, width=t, joint="curve")
+    elif kind == "tilde":
+        d.arc([mx - mw / 2, hh * 0.10, mx + mw / 2, hh * 1.15], start=200, end=340,
+              fill=255, width=t)
+    elif kind == "vec":
+        y = hh * 0.45
+        d.line([(mx - mw / 2, y), (mx + mw / 2, y)], fill=255, width=t)
+        d.line([(mx + mw / 2 - t * 2.2, y - t * 1.8), (mx + mw / 2, y),
+                (mx + mw / 2 - t * 2.2, y + t * 1.8)], fill=255, width=t, joint="curve")
+    else:  # dot / ddot
+        r = max(1.0, size * 0.075)
+        xs = [mx] if kind == "dot" else [mx - r * 1.6, mx + r * 1.6]
+        for x in xs:
+            d.ellipse([x - r, hh * 0.20 - r, x + r, hh * 0.20 + r], fill=255)
+    return (out, w, H, asc + hh)
+
+
+def _over(b, mark, size, scale=1.0, dy=0.0):
+    m = textbox(mark, size * 0.9 * scale, F_MATH)
+    m = scale_box(m, 1.0)
+    img, w, h, asc = b
+    mw = m[1]
+    W = max(w, mw)
+    H = h + m[2] * 1.02
+    out = _mk(W, H)
+    out.paste(img, (int((W - w) / 2), int(m[2] * 1.02 + dy * size)), img)
+    out.paste(m[0], (int((W - mw) / 2), 0), m[0])
+    return (out, W, H, asc + m[2] * 1.02)
+
+
+def _delim(ld, rd, inner, size, pad_k=0.0):
+    parts = []
+    pw = max(1, int(round(size * 0.05)))
+    if ld is not None:
+        parts.append(_delim_glyph(ld, inner[2], inner[3], size, True, pad_k))
+    parts.append(inner)
+    if rd is not None:
+        parts.append(_delim_glyph(rd, inner[2], inner[3], size, False, pad_k))
+    return hcat(parts)
+
+
+def _delim_glyph(ch, h, asc, size, left, pad_k=0.0):
+    need = h + size * (0.12 + pad_k * 2)
+    base = textbox(ch, size, F_MATH)
+    if need <= base[2] * 1.06 and ch not in ("{", "}"):
+        return shift(base, asc - base[3])
+    t = max(2, int(round(size * 0.062)))
+    if ch in ("(", ")"):
+        arc_w = size * 0.30
+        w = arc_w + size * 0.10
+        img = _mk(w, need)
+        d = _PILDraw.Draw(img)
+        x0 = size * 0.03 if left else (w - arc_w * 2 - size * 0.03)
+        bbox = [x0, -need * 0.01, x0 + arc_w * 2, need * 1.01]
+        if left:
+            d.arc(bbox, start=90, end=270, fill=255, width=t)
+        else:
+            d.arc(bbox, start=270, end=90, fill=255, width=t)
+    elif ch in ("[", "]"):
+        w = size * 0.34
+        img = _mk(w, need)
+        d = _PILDraw.Draw(img)
+        xe = size * 0.06 if left else w - size * 0.06
+        xo = xe + (size * 0.16 if left else -size * 0.16)
+        d.line([(xo, t / 2), (xe, t / 2), (xe, need - t / 2), (xo, need - t / 2)],
+               fill=255, width=t, joint="curve")
+    elif ch in ("\u27e8", "\u27e9"):
+        w = size * 0.42
+        img = _mk(w, need)
+        d = _PILDraw.Draw(img)
+        if left:
+            d.line([(w - t, t / 2), (t / 2, need / 2), (w - t, need - t / 2)],
+                   fill=255, width=t, joint="curve")
+        else:
+            d.line([(t / 2, t / 2), (w - t, need / 2), (t / 2, need - t / 2)],
+                   fill=255, width=t, joint="curve")
+    elif ch in ("{", "}"):
+        w = size * 0.40
+        img = _mk(w, need)
+        d = _PILDraw.Draw(img)
+        xin = size * 0.05 if left else w - size * 0.05
+        xout = size * 0.30 if left else w - size * 0.30
+        mid = need / 2
+        r = size * 0.16
+        # 上臂
+        d.arc([xout - r, t / 2 - r, xout + r, t / 2 + r], start=0, end=180, fill=255, width=t)
+        d.line([(xout, t / 2), (xin, t / 2)], fill=255, width=t)
+        d.line([(xin, t / 2), (xin, mid - r)], fill=255, width=t)
+        d.arc([xin - r if left else xin - r, mid - r, xin + r, mid + r],
+              start=270 if left else 90, end=90 if left else 270, fill=255, width=t)
+        d.line([(xin, mid + r), (xin, need - t / 2)], fill=255, width=t)
+        d.line([(xin, need - t / 2), (xout, need - t / 2)], fill=255, width=t)
+        d.arc([xout - r, need - t / 2 - r, xout + r, need - t / 2 + r],
+              start=180, end=360, fill=255, width=t)
+    elif ch in ("|", "\u2016"):
+        w = size * 0.20
+        img = _mk(w, need)
+        _PILDraw.Draw(img).rectangle([w * 0.35, 0, w * 0.35 + t, need - 1], fill=255)
+    else:
+        return shift(base, asc - base[3])
+    return (img, float(img.size[0]), float(img.size[1]), asc + size * (0.06 + pad_k))
+
+
+def _bigop(name, sup, sub, size):
+    sym = SYM.get(name, name)
+    bsz = size * (1.35 if name in INTEGRALS else 1.5)
+    b = textbox(sym, bsz, F_MATH)
+    if sup is None and sub is None:
+        return b
+    lim_sz = size * 0.7
+    if name in INTEGRALS:
+        # 积分：上下限放右侧
+        parts = [b]
+        if sup:
+            sb = layout(sup, lim_sz)
+            parts.append(shift(sb, b[2] * 0.45))
+        if sub:
+            db = layout(sub, lim_sz)
+            parts.append(shift(db, -b[2] * 0.28))
+        return hcat(parts)
+    col = []
+    if sup:
+        col.append(layout(sup, lim_sz))
+    col.append(b)
+    if sub:
+        col.append(layout(sub, lim_sz))
+    return vcat(col, gap=size * 0.04)
+
+
+def _matrix(env, body, size):
+    rows = [[]]
+    cur = []
+    for n in body:
+        if n is None:
+            continue
+        if n[0] == "newline":
+            cur.append(n)
+            rows[-1] = cur
+            cur = []
+            rows.append([])
+            continue
+        cur.append(n)
+    if cur:
+        rows[-1] = cur
+    rows = [r for r in rows if any(x[0] != "space" for x in r) or r]
+
+    cells = []
+    for r in rows:
+        cols, cell = [], []
+        for n in r:
+            if n[0] == "space" and getattr(n, "_amp", False):
+                pass
+            cell.append(n)
+        cells.append(cell)
+    # 用 & 切列：解析时 & -> ('space', 0.0) 丢了标记，这里改用文本 & 的节点
+    # 简化：重新按 ('amp',) 切（parse_one 里 & 已映射为 amp 见下）
+    grid = []
+    for r in rows:
+        row, cell = [], []
+        for n in r:
+            if n[0] == "amp":
+                row.append(cell)
+                cell = []
+            else:
+                cell.append(n)
+        row.append(cell)
+        grid.append(row)
+
+    msz = size * 0.95
+    laid = [[layout(c, msz) for c in row] for row in grid]
+    ncol = max(len(r) for r in laid)
+    colw = [0.0] * ncol
+    for row in laid:
+        for j, b in enumerate(row):
+            colw[j] = max(colw[j], b[1])
+    cg = size * 0.55
+    rg = size * 0.32
+    rowh = [max(b[2] for b in row) for row in laid]
+    asc0 = [max(b[3] for b in row) for row in laid]
+    W = sum(colw) + cg * (ncol - 1)
+    H = sum(rowh) + rg * (len(rowh) - 1)
+    img = _mk(W, H)
+    y = 0.0
+    for ri, row in enumerate(laid):
+        x = 0.0
+        for j, b in enumerate(row):
+            dx = x + (colw[j] - b[1]) / 2
+            img.paste(b[0], (int(dx), int(y + asc0[ri] - b[3])), b[0])
+            x += colw[j] + cg
+        y += rowh[ri] + rg
+    box = (img, W, H, asc0[0] if asc0 else H / 2)
+    pre = {"pmatrix": ("(", ")"), "bmatrix": ("[", "]"),
+           "vmatrix": ("|", "|"), "Bmatrix": ("{", "}"),
+           "cases": ("{", None)}.get(env)
+    if pre:
+        return _delim(pre[0], pre[1], box, size, pad_k=0.12)
+    return box
+
+
+# --------------------------------------------------------------------------
+# 对外接口
+# --------------------------------------------------------------------------
+def render(tex, size=17, color=(235, 235, 235)):
+    """tex: 纯公式源码（不带 $）。返回 (PIL RGBA Image, asc_px) 或 None。"""
+    try:
+        p = P(tokenize(tex))
+        nodes = p.parse()
+        box = layout(nodes, size * SS)
+        img, w, h, asc = box
+        if img.size[0] < 2 or img.size[1] < 2:
+            return None
+        if w > 4000 * SS:
+            return None
+        img = img.resize((max(1, int(round(w / SS))), max(1, int(round(h / SS)))),
+                         _PILImage.LANCZOS)
+        out = _PILImage.new("RGBA", img.size, (0, 0, 0, 0))
+        solid = _PILImage.new("RGBA", img.size, tuple(color) + (255,))
+        out.paste(solid, (0, 0), img)
+        return out, asc / SS
+    except Exception:
+        return None
+
+
+MATH_SPLIT = re.compile(r"(\$\$.*?\$\$|\$[^$\n]+?\$|\\\[.*?\\\]|\\\(.*?\\\))", re.S)
+FENCE_SPLIT = re.compile(r"(```.*?```)", re.S)
+ESC_DOLLAR = "\x01"      # 转义美元 \$ 的临时占位
+
+
+def _split_inline(s):
+    out = []
+    for part in MATH_SPLIT.split(s):
+        if not part:
+            continue
+        if part.startswith("$$") and part.endswith("$$") and len(part) > 3:
+            out.append(("math", part[2:-2], True))
+        elif part.startswith("\\[") and part.endswith("\\]"):
+            out.append(("math", part[2:-2], True))
+        elif part.startswith("$") and part.endswith("$") and len(part) > 2:
+            out.append(("math", part[1:-1], False))
+        elif part.startswith("\\(") and part.endswith("\\)"):
+            out.append(("math", part[2:-2], False))
+        else:
+            out.append(("text", part))
+    return out
+
+
+def split_math(s):
+    """-> [('text', s) | ('math', src, displaybool)]
+
+    代码块里的 $ 不当公式；\$（金额）也不算公式分隔符。
+    """
+    out = []
+    for i, chunk in enumerate(FENCE_SPLIT.split(s)):
+        if not chunk:
+            continue
+        if i % 2:                       # ```...``` 原样保留
+            out.append(("text", chunk))
+            continue
+        for seg in _split_inline(chunk.replace("\\$", ESC_DOLLAR)):
+            if seg[0] == "text":
+                out.append(("text", seg[1].replace(ESC_DOLLAR, "$")))
+            else:
+                out.append(("math", seg[1].replace(ESC_DOLLAR, "$"), seg[2]))
+    return out
+
+
+_SUP = {"0": "\u2070", "1": "\u00b9", "2": "\u00b2", "3": "\u00b3", "4": "\u2074",
+        "5": "\u2075", "6": "\u2076", "7": "\u2077", "8": "\u2078", "9": "\u2079",
+        "+": "\u207a", "-": "\u207b", "n": "\u207f", "i": "\u2071"}
+_SUB = {"0": "\u2080", "1": "\u2081", "2": "\u2082", "3": "\u2083", "4": "\u2084",
+        "5": "\u2085", "6": "\u2086", "7": "\u2087", "8": "\u2088", "9": "\u2089",
+        "+": "\u208a", "-": "\u208b", "n": "\u2099", "i": "\u1d62", "j": "\u2c7c"}
+
+_FRAC_SIMPLE = re.compile(r"\\[dt]?frac\s*\{([^{}]*)\}\s*\{([^{}]*)\}")
+_SQRT_SIMPLE = re.compile(r"\\sqrt\s*\{([^{}]*)\}")
+_TEXT_CMD = re.compile(r"\\(?:text|mathrm|textrm|mathbf|mathit|operatorname)\s*\{([^{}]*)\}")
+_SUP_CMD = re.compile(r"\^\s*\{?([0-9n+\-])\}?")
+_SUB_CMD = re.compile(r"_\s*\{?([0-9n+\-])\}?")
+_CMD = re.compile(r"\\([a-zA-Z]+)")
+
+
+def latex_to_unicode(s):
+    """流式阶段的近似显示：把公式源码变可读文本，不是终稿。"""
+    for tok in ("$$", "\\[", "\\]", "\\(", "\\)"):
+        s = s.replace(tok, "")
+    for _ in range(3):
+        s = _FRAC_SIMPLE.sub(lambda m: "(%s)/(%s)" % (m.group(1), m.group(2)), s)
+        s = _SQRT_SIMPLE.sub(lambda m: "\u221a(%s)" % m.group(1), s)
+    s = _TEXT_CMD.sub(lambda m: m.group(1), s)
+    s = _SUP_CMD.sub(lambda m: _SUP.get(m.group(1), m.group(0)), s)
+    s = _SUB_CMD.sub(lambda m: _SUB.get(m.group(1), m.group(0)), s)
+
+    def _rep(m):
+        n = m.group(1)
+        return GREEK.get(n) or SYM.get(n) or m.group(0)   # 不认识的命令留着，别把 C:\Users 吃成 C:Users
+    s = _CMD.sub(_rep, s)
+    return s
+
+
 class App:
     def __init__(self, root: tk.Tk):
         self.root = root
@@ -491,6 +1386,8 @@ class App:
         self._tok_live = False
         self.photo = None
         self.thumb_img = None
+        self._photos: list = []   # 公式图片引用（不放这里会被 GC 掉）
+        self._ai_start = None     # 本轮回复在 text 里的起点，流式结束后重绘用
         self._crt_base: Image.Image | None = None
         self._crt_phase = 0
         self._crt_on = True
@@ -1168,6 +2065,8 @@ class App:
     def clear_chat(self):
         self.text.configure(state="normal")
         self.text.delete("1.0", "end")
+        self._photos.clear()
+        self._ai_start = None
         self.text.insert("end", "CAPTURED\n", "meta")
         self.text.insert("end", "画面已截，直接问。追问不用重新截。\n", "meta")
         self.text.configure(state="disabled")
@@ -1207,6 +2106,7 @@ class App:
         self.text.insert("end", (MODEL_LABEL.split(":")[0].upper() if PROVIDER == "ollama" else "MODEL") + "\n",
                          "ai")
         self.text.configure(state="disabled")
+        self._ai_start = self.text.index("end-1c")   # 流式结束后从这里整体重绘
         self.text.see("end")
 
         if not self.messages:
@@ -1430,6 +2330,81 @@ class App:
         self.text.configure(state="disabled")
         self.text.see("end")
 
+    # ---------------- 公式渲染 ----------------
+    def _math_px(self) -> int:
+        """行内公式字号：跟正文行高对齐。"""
+        try:
+            f = tkfont.Font(root=self.root, font=(SANS, 12))
+            return max(12, int(round(f.metrics("linespace") * 0.80)))
+        except Exception:
+            return 15
+
+    def _img_math(self, src, tag="body") -> bool:
+        if F_MATH is None:
+            return False
+        try:
+            rgb = tuple(int(INK[i:i + 2], 16) for i in (1, 3, 5))
+            r = render(src, self._math_px(), rgb)
+        except Exception:
+            log("latex render fail: %s" % traceback.format_exc(limit=1))
+            r = None
+        if not r:
+            return False
+        im = r[0]
+        try:
+            maxw = max(160, self.text.winfo_width() - 64)
+            if im.size[0] > maxw:
+                k = maxw / float(im.size[0])
+                im = im.resize((int(maxw), max(1, int(im.size[1] * k))), _PILImage.LANCZOS)
+            flat = _PILImage.new("RGB", im.size, self.text.cget("bg"))
+            flat.paste(im, (0, 0), im)
+            ph = ImageTk.PhotoImage(flat)
+        except Exception:
+            return False
+        self._photos.append(ph)
+        self.text.image_create("end", image=ph, align="center", padx=3, pady=0)
+        return True
+
+    def _emit(self, src, tag="body"):
+        """按 $...$ / $$...$$ 切段：文字直插，公式渲染成图片。"""
+        prev_disp = False
+        for seg in split_math(src):
+            if seg[0] == "text":
+                t = seg[1]
+                if prev_disp and t.startswith("\n"):
+                    t = t[1:]        # 行间公式后面已经补过换行，别再多空一行
+                prev_disp = False
+                if t:
+                    self.text.insert("end", t, tag)
+                continue
+            body, disp = seg[1], seg[2]
+            tex = body.strip()
+            if not tex:
+                continue
+            if disp:
+                tail = self.text.get("end-3c", "end-1c")
+                if not tail.endswith("\n\n"):
+                    self.text.insert("end", "\n", tag)
+            if not self._img_math(tex, tag):
+                self.text.insert("end", body, tag)   # 渲染失败就显示源码，不吞内容
+            if disp:
+                self.text.insert("end", "\n", tag)
+                prev_disp = True
+
+    def _replace_stream(self, src, tag="body"):
+        """把流式期间的草稿整段替换成渲染版（公式变图）。"""
+        start = getattr(self, "_ai_start", None)
+        self.text.configure(state="normal")
+        if start:
+            try:
+                self.text.delete(start, "end-1c")
+            except tk.TclError:
+                pass
+        self._emit(src, tag)
+        self.text.insert("end", "\n", tag)
+        self.text.configure(state="disabled")
+        self.text.see("end")
+
     def poll(self):
         if self._tok_live and self._tok_pending != self._tok_shown:
             self._tok_shown = self._tok_pending
@@ -1438,7 +2413,7 @@ class App:
             while True:
                 kind, payload = self.ui_q.get_nowait()
                 if kind == "delta":
-                    self._insert(payload, "body")
+                    self._insert(latex_to_unicode(payload), "body")
                 elif kind == "usage":
                     self.tok_in += payload[0]
                     self.tok_out += payload[1]
@@ -1454,9 +2429,9 @@ class App:
                     self.send_btn.configure(bg=PANEL, fg=ACCENT, text="SEND")
                     el = time.time() - self.t0
                     if not payload:
-                        self._insert("(空回复)\n", "err")
+                        self._replace_stream("(空回复)\n", "err")
                     else:
-                        self._insert("\n", "body")
+                        self._replace_stream(payload, "body")
                     self.set_status("READY · %.1fs" % el, DIM)
                 elif kind == "err":
                     self.busy = False
