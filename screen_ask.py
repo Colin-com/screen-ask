@@ -343,6 +343,11 @@ class App:
         self.panel = None
         self.viewer = None
         self.busy = False
+        self.tok_in = 0          # 累计精确值（API usage）
+        self.tok_out = 0
+        self._tok_pending = 0    # 工作线程写入的已收字符数
+        self._tok_shown = -1
+        self._tok_live = False
         self.photo = None
         self.thumb_img = None
         self._crt_base: Image.Image | None = None
@@ -505,8 +510,13 @@ class App:
         self.send_btn.bind("<Enter>", lambda e: self._btn_hover(True))
         self.send_btn.bind("<Leave>", lambda e: self._btn_hover(False))
 
-        tk.Label(foot, text="ENTER SEND    ESC HIDE    ^R RECAP", bg=PANEL, fg=MUTED,
-                 font=(PIX, PIX_SZ)).pack(side="bottom", anchor="w", padx=18, pady=(0, 10))
+        status_row = tk.Frame(foot, bg=PANEL)
+        status_row.pack(side="bottom", fill="x", padx=18, pady=(0, 10))
+        tk.Label(status_row, text="ENTER SEND    ESC HIDE    ^R RECAP", bg=PANEL, fg=MUTED,
+                 font=(PIX, PIX_SZ)).pack(side="left")
+        self.tok_lbl = tk.Label(status_row, text="TOK  --", bg=PANEL, fg=LINE2,
+                                font=(PIX, PIX_SZ))
+        self.tok_lbl.pack(side="right")
 
         win.bind("<Escape>", lambda e: (self._close_panel() if self.panel else self.hide()))
         win.bind("<Control-r>", lambda e: self.resnap())
@@ -1033,6 +1043,10 @@ class App:
         self.entry.delete("1.0", "end")
         self._ph_set()
         self.busy = True
+        self._tok_pending = 0
+        self._tok_shown = -1
+        self._tok_live = True
+        self._tok_show()
         self.send_btn.configure(bg=PANEL, fg=DIM, text="WAIT")
         self.set_status("STREAMING", ACCENT)
 
@@ -1093,8 +1107,11 @@ class App:
                         d = (j.get("message") or {}).get("content") or ""
                         if d:
                             acc += d
+                            self._tok_pending = len(acc)
                             self.ui_q.put(("delta", d))
                         if j.get("done"):
+                            self.ui_q.put(("usage", (j.get("prompt_eval_count") or 0,
+                                                     j.get("eval_count") or 0)))
                             break
             else:
                 if not DS_KEY:
@@ -1106,6 +1123,8 @@ class App:
                     "max_tokens": 3000,
                     "thinking": {"type": "disabled"},
                 }
+                if "deepseek.com" in deepseek_url():
+                    payload["stream_options"] = {"include_usage": True}
                 req = urllib.request.Request(
                     deepseek_url(),
                     data=json.dumps(payload).encode(),
@@ -1128,13 +1147,43 @@ class App:
                         delta = (ch[0].get("delta") or {}).get("content")
                         if delta:
                             acc += delta
+                            self._tok_pending = len(acc)
                             self.ui_q.put(("delta", delta))
+                        u = j.get("usage")
+                        if u:
+                            self.ui_q.put(("usage", (u.get("prompt_tokens") or 0,
+                                                     u.get("completion_tokens") or 0)))
             self.ui_q.put(("done", acc))
         except urllib.error.HTTPError as e:
             body = e.read().decode("utf-8", "ignore")[:300]
             self.ui_q.put(("err", "HTTP %s %s" % (e.code, body)))
         except Exception as e:
             self.ui_q.put(("err", "%s: %s" % (type(e).__name__, e)))
+
+    @staticmethod
+    def _fmt_tok(n):
+        n = int(n or 0)
+        if n >= 10000:
+            return "%.0fk" % (n / 1000.0)
+        if n >= 1000:
+            return "%.1fk" % (n / 1000.0)
+        return str(n)
+
+    def _tok_show(self, inn=None, out=None):
+        """流式只报输出（不编造输入数），结束后补 API 返回的精确 usage。"""
+        if getattr(self, "tok_lbl", None) is None:
+            return
+        if self._tok_live:
+            est = int(self._tok_pending / 1.8) if self._tok_pending else 0
+            self.tok_lbl.configure(text="TOK  \u2193%s" % self._fmt_tok(est), fg=ACCENT)
+            return
+        if inn is None:
+            inn, out = self.tok_in, self.tok_out
+        self.tok_lbl.configure(
+            text="TOK  \u2191%s  \u2193%s  \u03a3%s"
+                 % (self._fmt_tok(inn), self._fmt_tok(out),
+                    self._fmt_tok(self.tok_in + self.tok_out)),
+            fg=MUTED)
 
     def _insert(self, s, tag):
         self.text.configure(state="normal")
@@ -1143,11 +1192,19 @@ class App:
         self.text.see("end")
 
     def poll(self):
+        if self._tok_live and self._tok_pending != self._tok_shown:
+            self._tok_shown = self._tok_pending
+            self._tok_show()
         try:
             while True:
                 kind, payload = self.ui_q.get_nowait()
                 if kind == "delta":
                     self._insert(payload, "body")
+                elif kind == "usage":
+                    self.tok_in += payload[0]
+                    self.tok_out += payload[1]
+                    self._tok_live = False
+                    self._tok_show(payload[0], payload[1])
                 elif kind == "done":
                     self.messages.append({"role": "assistant", "content": payload})
                     self.busy = False
