@@ -973,6 +973,9 @@ class App:
         if not model:
             self.pmsg.configure(text="MODEL 不能为空", fg=ACCENT)
             return
+        if not (url or pdef["base"]):
+            self.pmsg.configure(text="BASE URL 不能为空", fg=ACCENT)
+            return
         if pdef["api"] != "ollama" and not key:
             self.pmsg.configure(text="API KEY 不能为空", fg=ACCENT)
             return
