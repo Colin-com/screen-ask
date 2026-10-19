@@ -18,7 +18,7 @@ Screen Ask 把它压成一步：**按热键，浮窗已经在截图上方，直�
 
 - **一键盘唤出**：默认 `Ctrl+Alt+Q`，再按一次收起
 - **多轮追问**：截图只发一次，后续问题复用同一张图，省 token
-- **两种后端**：云端 DeepSeek / 本地 Ollama（qwen2.5vl 等），界面上随时切换
+- **六种后端**：DeepSeek / OpenAI / Claude / OpenRouter / 本地 Ollama / 任意 OpenAI 兼容端点（中转站、one-api、vLLM），界面上随时切
 - **大图查看器**：点缩略图放大，滚轮缩放（5%–1000%，以鼠标为锚点）、拖动平移、双击回自适应
 - **界面内配置 API**：顶栏 `API` → 填 Provider / Model / Base URL / Key → 写回本机 `.env`
 - **零界面框架**：tkinter 手绘面板，直角 + 1px 细线 + 单色信号红，没有圆角卡片和渐变
@@ -32,15 +32,64 @@ Screen Ask 把它压成一步：**按热键，浮窗已经在截图上方，直�
 
 ## 安装
 
-需要 Python 3.9+（自带 tkinter）和一个能截图的桌面会话。
+三种方式，装完都能从桌面图标或 `Ctrl+Alt+Q` 启动。
+
+**A. 一键（Windows）**
+
+1. 到 [Releases](../../releases) 下载 `screen-ask-<版本>.zip`
+2. 解压到任意目录
+3. 双击 `install.bat` —— 装 Pillow、生成 8-bit 图标、在桌面建快捷方式
+
+**B. 从源码**
 
 ```bash
-git clone <this-repo>
-cd screen-ask
-pip install -r requirements.txt      # 只有 Pillow
-cp .env.example .env                 # 然后填入你的 API Key
-python screen_ask.py
+git clone <this-repo> && cd screen-ask
+pip install -r requirements.txt
+python install.ps1        # Windows：生成图标 + 桌面快捷方式
+python screen_ask.py      # 直接跑
 ```
+
+**C. 不要快捷方式**
+
+`install.ps1 -NoShortcut`；已经建过的用 `python tools/make_shortcut.py --remove` 删掉。
+
+桌面图标是按 32×32 逻辑网格画的红色取景框，用 NEAREST 整数倍放大生成 `assets/icon.ico`（16/32/48/64/128/256 六档），所以小尺寸下也是硬边，不会糊成灰团。
+
+## 支持哪些模型
+
+| Provider | 协议 | 默认端点 | 备注 |
+|---|---|---|---|
+| `DEEPSEEK` | OpenAI 兼容 | `api.deepseek.com` | 默认。便宜，缓存命中价是未命中的 1/50 |
+| `OPENAI` | OpenAI | `api.openai.com/v1` | GPT-6 / 5.x 系列 |
+| `CLAUDE` | Anthropic Messages | `api.anthropic.com` | Opus / Sonnet / Haiku，`x-api-key` + `anthropic-version` |
+| `OPENROUTER` | OpenAI 兼容 | `openrouter.ai/api/v1` | 一个 key 通吃各家模型 |
+| `OLLAMA` | Ollama 原生 | `127.0.0.1:11434` | 本地跑，不需要 key |
+| `CUSTOM` | OpenAI 兼容 | 自己填 | 中转站 / one-api / vLLM / LM Studio |
+
+协议差异在代码里是分开走的：OpenAI 系读 `choices[0].delta.content`，Anthropic 读
+`content_block_delta`，Ollama 读 `message.content`；usage 也分别归一成
+`(输入, 输出, 缓存命中)` 三元组。所以换 provider 不用改 prompt，也不影响 token 计数。
+
+> **国内网络的现实**：直连 `api.openai.com` 会超时，`api.anthropic.com` 返回
+> `403 forbidden / Request not allowed`（地区限制）。这不是软件的问题。
+> 想用 GPT / Claude，把 provider 设成 `CUSTOM`、BASE URL 填你的中转地址即可 ——
+> 协议完全一样，key 用中转站发的。
+
+## 花费估算
+
+内置价目表抓自各官方定价页（2026-10）：DeepSeek 分高峰/空闲两套价、OpenAI 三档、
+Anthropic 三档，都区分缓存命中与未命中。**查不到的模型显示 `¥—`，不猜价格。**
+
+要覆盖，在 `.env` 里填（USD / 1M tokens）：
+
+```
+SA_PRICE_IN=2.0
+SA_PRICE_OUT=10.0
+SA_PRICE_CACHED=0.1
+```
+
+人民币按 7.15 折算。这是估算，不等于账单；DeepSeek 的法定节假日按空闲价计费，
+代码里没有节假日日历，所以节假日会略微高估。
 
 Windows 想让它不带黑色控制台窗口：
 
@@ -58,12 +107,13 @@ start.bat
 
 | 键 | 说明 | 默认 |
 | --- | --- | --- |
-| `SA_PROVIDER` | `deepseek` 或 `ollama` | `deepseek` |
-| `DEEPSEEK_API_KEY` | DeepSeek API Key | — |
-| `SA_DEEPSEEK_BASE` | API 地址（可换中转/自建） | `https://api.deepseek.com` |
-| `SA_DEEPSEEK_MODEL` | 支持图片输入的模型名 | `deepseek-v4-flash-vision-exp` |
-| `OLLAMA_URL` | 本地 Ollama 地址 | `http://127.0.0.1:11434` |
-| `SA_OLLAMA_MODEL` | 本地视觉模型 | `qwen2.5vl:7b` |
+| `SA_PROVIDER` | `deepseek` / `openai` / `anthropic` / `openrouter` / `ollama` / `custom` | `deepseek` |
+| `SA_MODEL` | 当前模型名（界面里改了会写回这里） | 按 provider 预设 |
+| `SA_BASE` | 当前端点（可指向中转站） | 按 provider 预设 |
+| `SA_KEY` | 当前 key | — |
+| `DEEPSEEK_API_KEY` / `OPENAI_API_KEY` / `ANTHROPIC_API_KEY` | 各家 key，旧的单独键仍然认 | — |
+| `OLLAMA_URL` / `SA_OLLAMA_MODEL` | 本地 Ollama 地址与视觉模型 | `127.0.0.1:11434` / `qwen2.5vl:7b` |
+| `SA_PRICE_IN` / `SA_PRICE_OUT` / `SA_PRICE_CACHED` | 覆盖单价（USD/1M） | 用内置价目表 |
 | `SA_HOTKEY` | 热键 | `ctrl+alt+q` |
 | `SCREEN_ASK_HOME` | 用户目录（存 `.env` 和 `run.log`） | `~/.screen-ask` |
 

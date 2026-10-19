@@ -74,14 +74,40 @@ def is_peak(now=None):
     return (1.0 <= h < 4.0) or (6.0 <= h < 10.0)
 
 
-def token_cost(prompt, completion, cache_hit=0):
-    """按官方分档计价，返回美元。"""
+def resolve_price(model=None):
+    """返回 (输入, 输出, 缓存命中) USD/1M；未知模型返回 None，宁可显示 ¥— 也不瞎猜。"""
+    env_in = ENV.get("SA_PRICE_IN")
+    env_out = ENV.get("SA_PRICE_OUT")
+    if env_in and env_out:
+        try:
+            return (float(env_in), float(env_out), float(ENV.get("SA_PRICE_CACHED") or env_in))
+        except ValueError:
+            pass
+    table = prov().get("pricing") or {}
+    name = (model or DS_MODEL or "").lower()
+    hit = None
+    for k in table:
+        if k.lower() in name and (hit is None or len(k) > len(hit)):
+            hit = k
+    if hit is None:
+        return None
+    return table[hit]
+
+
+def token_cost(prompt, completion, cache_hit=0, model=None):
+    """按 provider 价格表计价，返回美元；未知模型返回 None。"""
+    price = resolve_price(model)
+    if price is None:
+        return None
+    p_in, p_out, p_hit = price
+    mult = 1.0
+    if prov().get("peak_mult") and is_peak():
+        mult = float(prov()["peak_mult"])
     prompt = int(prompt or 0)
     completion = int(completion or 0)
     hit = max(0, min(int(cache_hit or 0), prompt))
     miss = prompt - hit
-    p_hit, p_miss, p_out = PRICE["peak" if is_peak() else "offpeak"]
-    return (hit * p_hit + miss * p_miss + completion * p_out) / 1e6
+    return (hit * p_hit + miss * p_in + completion * p_out) * mult / 1e6
 
 # 基准尺寸（96 DPI 下的逻辑像素），实际窗口按屏幕与 DPI 自适应
 BASE_W, BASE_H = 760, 840
@@ -188,7 +214,7 @@ def read_env() -> dict:
             pass
     # 环境变量优先级最高
     for k, v in os.environ.items():
-        if k.startswith(("DEEPSEEK_", "SA_", "OLLAMA_")):
+        if k.startswith(("DEEPSEEK_", "SA_", "OLLAMA_", "OPENAI_", "ANTHROPIC_")):
             d[k] = v
     return d
 
@@ -230,19 +256,103 @@ def write_env(updates: dict) -> Path:
 
 ENV = read_env()
 
+# 各家预设：api 决定协议（openai / anthropic / ollama）
+# pricing = {模型名包含的关键字: (输入 USD/1M, 输出 USD/1M, 缓存命中 USD/1M)}
+# 查不到模型就返回 None，界面显示 ¥—，不瞎猜价格
+PROVIDERS = {
+    "deepseek": {
+        "label": "DEEPSEEK", "api": "openai",
+        "base": "https://api.deepseek.com", "model": "deepseek-flash",
+        "peak_mult": 2.0,       # 官方：off-peak 是 peak 的一半
+        "pricing": {
+            "deepseek-flash": (0.15, 0.6, 0.003),
+            "deepseek-v4-flash": (0.15, 0.6, 0.003),
+            "deepseek-v4-pro": (0.66, 1.98, 0.022),
+        },
+    },
+    "openai": {
+        "label": "OPENAI", "api": "openai",
+        "base": "https://api.openai.com/v1", "model": "gpt-6.1-sol",
+        "pricing": {
+            "gpt-6-astra": (10.0, 50.0, 1.0),
+            "gpt-6.1-sol": (2.0, 10.0, 0.1),
+            "gpt-6-luna": (0.1, 0.5, 0.01),
+            "gpt-5.6-sol": (4.0, 20.0, 0.4),
+        },
+    },
+    "anthropic": {
+        "label": "CLAUDE", "api": "anthropic",
+        "base": "https://api.anthropic.com", "model": "claude-opus-5-5",
+        "pricing": {
+            "claude-opus-5-5": (4.0, 20.0, 0.4),
+            "claude-sonnet-5-5": (2.0, 10.0, 0.2),
+            "claude-haiku-5-5": (0.1, 0.5, 0.01),
+            "claude-fable-5-1": (10.0, 50.0, 1.0),
+        },
+    },
+    "openrouter": {
+        "label": "OPENROUTER", "api": "openai",
+        "base": "https://openrouter.ai/api/v1", "model": "anthropic/claude-opus-5.5",
+        "pricing": {},
+    },
+    "ollama": {
+        "label": "OLLAMA", "api": "ollama",
+        "base": "http://127.0.0.1:11434", "model": "qwen2.5vl:7b",
+        "pricing": {},
+    },
+    "custom": {
+        "label": "CUSTOM", "api": "openai",
+        "base": "", "model": "", "pricing": {},
+    },
+}
+
 PROVIDER = (ENV.get("SA_PROVIDER") or "deepseek").lower()
-OLLAMA_BASE = (ENV.get("OLLAMA_URL") or "http://127.0.0.1:11434").rstrip("/")
-OLLAMA_MODEL = ENV.get("SA_OLLAMA_MODEL") or "qwen2.5vl:7b"
-DS_BASE = (ENV.get("SA_DEEPSEEK_BASE") or "https://api.deepseek.com").rstrip("/")
-DS_MODEL = ENV.get("SA_DEEPSEEK_MODEL") or "deepseek-v4-flash-vision-exp"
-DS_KEY = ENV.get("DEEPSEEK_API_KEY") or ""
-MODEL_LABEL = OLLAMA_MODEL if PROVIDER == "ollama" else DS_MODEL
+if PROVIDER not in PROVIDERS:
+    PROVIDER = "deepseek"
+
+
+_KEY_ENV = {"deepseek": "DEEPSEEK_API_KEY", "openai": "OPENAI_API_KEY",
+            "anthropic": "ANTHROPIC_API_KEY"}
+
+
+def key_for(k):
+    return ENV.get(_KEY_ENV.get(k, "")) or ""
+
+
+def prov(k=None) -> dict:
+    return PROVIDERS.get(k or PROVIDER) or PROVIDERS["deepseek"]
+
+
+# 统一键优先，旧键兜底（老用户的 .env 照样能用）
+OLLAMA_BASE = (ENV.get("OLLAMA_URL") or PROVIDERS["ollama"]["base"]).rstrip("/")
+OLLAMA_MODEL = ENV.get("SA_OLLAMA_MODEL") or PROVIDERS["ollama"]["model"]
+_legacy_key = {"deepseek": "DEEPSEEK_API_KEY", "openai": "OPENAI_API_KEY",
+               "anthropic": "ANTHROPIC_API_KEY"}.get(PROVIDER, "DEEPSEEK_API_KEY")
+DS_BASE = (ENV.get("SA_BASE")
+           or (ENV.get("SA_DEEPSEEK_BASE") if PROVIDER == "deepseek" else None)
+           or (OLLAMA_BASE if PROVIDER == "ollama" else None)
+           or prov()["base"]).rstrip("/")
+DS_MODEL = (ENV.get("SA_MODEL")
+            or (ENV.get("SA_OLLAMA_MODEL") if PROVIDER == "ollama" else None)
+            or (ENV.get("SA_DEEPSEEK_MODEL") if PROVIDER == "deepseek" else None)
+            or prov()["model"])
+DS_KEY = ENV.get("SA_KEY") or ENV.get(_legacy_key) or ""
+MODEL_LABEL = DS_MODEL
 
 HOTKEY_SPEC = ENV.get("SA_HOTKEY") or "ctrl+alt+q"
 
 
+def endpoint(path="/chat/completions", base=None) -> str:
+    """拼端点。用户把完整路径也填进 BASE URL 时不会拼出双段。"""
+    b = (base or DS_BASE or "").rstrip("/")
+    for suf in ("/chat/completions", "/messages"):
+        if b.endswith(suf):
+            b = b[: -len(suf)]
+    return b + path
+
+
 def deepseek_url() -> str:
-    return DS_BASE + "/chat/completions"
+    return endpoint()
 
 
 # ---------------------------------------------------------------- 热键
@@ -375,6 +485,7 @@ class App:
         self.tok_in = 0          # 累计精确值（API usage）
         self.tok_out = 0
         self.cost_usd = 0.0      # 累计花费（按官方分档价估算）
+        self.cost_known = True   # 遇到未定价模型就置 False，显示 ¥—
         self._tok_pending = 0    # 工作线程写入的已收字符数
         self._tok_shown = -1
         self._tok_live = False
@@ -552,7 +663,7 @@ class App:
         win.bind("<Control-r>", lambda e: self.resnap())
         win.bind("<Control-q>", lambda e: self.hide())
 
-        if not DS_KEY and PROVIDER != "ollama":
+        if not DS_KEY and prov()["api"] != "ollama":
             self.set_status("NO KEY", ACCENT)
 
     def _model_text(self) -> str:
@@ -797,11 +908,11 @@ class App:
         tabs.pack(anchor="w", pady=(6, 18))
         self.pv = tk.StringVar(value=PROVIDER)
         self.tab_map = {}
-        for key, txt in (("ollama", "OLLAMA  本地"), ("deepseek", "DEEPSEEK  云端")):
+        for key, pdef in PROVIDERS.items():
             holder = tk.Frame(tabs, bg=LINE2)
-            holder.pack(side="left", padx=(0, 8))
-            lb = tk.Label(holder, text=txt, bg=PANEL, fg=DIM, font=(PIX, PIX_SZ),
-                          padx=12, pady=6, cursor="hand2")
+            holder.pack(side="left", padx=(0, 6))
+            lb = tk.Label(holder, text=pdef["label"], bg=PANEL, fg=DIM, font=(PIX, PIX_SZ),
+                          padx=10, pady=6, cursor="hand2")
             lb.pack(padx=1, pady=1)
             lb.bind("<Button-1>", lambda e, k=key: self._pick_provider(k))
             self.tab_map[key] = lb
@@ -818,8 +929,8 @@ class App:
             e.insert(0, default or "")
             return e
 
-        self.f_model = field("MODEL", OLLAMA_MODEL if PROVIDER == "ollama" else DS_MODEL)
-        self.f_url = field("BASE URL", OLLAMA_BASE if PROVIDER == "ollama" else DS_BASE)
+        self.f_model = field("MODEL", DS_MODEL)
+        self.f_url = field("BASE URL", DS_BASE)
         self.f_key = field("API KEY", DS_KEY, show="•")
         self._pick_provider(PROVIDER)
 
@@ -827,27 +938,22 @@ class App:
         self.pv.set(k)
         for key, lb in self.tab_map.items():
             lb.configure(bg=ACCENT if key == k else PANEL, fg="#0b0b0d" if key == k else DIM)
-        if k == "ollama":
-            self.f_model.configure(state="normal")
-            self.f_model.delete(0, "end")
-            self.f_model.insert(0, OLLAMA_MODEL)
-            self.f_url.configure(state="normal")
-            self.f_url.delete(0, "end")
-            self.f_url.insert(0, OLLAMA_BASE)
-            self.f_key.configure(state="normal")
-            self.f_key.delete(0, "end")
-            self.f_key.insert(0, "本地模型不需要 key")
+        pdef = prov(k)
+        if k == PROVIDER:
+            model, url, keyv = DS_MODEL, DS_BASE, DS_KEY
+        else:
+            model, url, keyv = pdef["model"], pdef["base"], key_for(k)
+        local = pdef["api"] == "ollama"
+        for w, val in ((self.f_model, model), (self.f_url, url)):
+            w.configure(state="normal")
+            w.delete(0, "end")
+            w.insert(0, val or "")
+        self.f_key.configure(state="normal")
+        self.f_key.delete(0, "end")
+        if local:
             self.f_key.configure(state="disabled")
         else:
-            self.f_model.configure(state="normal")
-            self.f_model.delete(0, "end")
-            self.f_model.insert(0, DS_MODEL)
-            self.f_url.configure(state="normal")
-            self.f_url.delete(0, "end")
-            self.f_url.insert(0, DS_BASE)
-            self.f_key.configure(state="normal")
-            self.f_key.delete(0, "end")
-            self.f_key.insert(0, DS_KEY)
+            self.f_key.insert(0, keyv or "")
 
     def _close_panel(self):
         if self.panel is not None:
@@ -863,26 +969,36 @@ class App:
         model = self.f_model.get().strip()
         url = self.f_url.get().strip().rstrip("/")
         key = self.f_key.get().strip()
+        pdef = prov(k)
+        if not model:
+            self.pmsg.configure(text="MODEL 不能为空", fg=ACCENT)
+            return
+        if pdef["api"] != "ollama" and not key:
+            self.pmsg.configure(text="API KEY 不能为空", fg=ACCENT)
+            return
+        upd = {"SA_PROVIDER": k, "SA_MODEL": model, "SA_BASE": url or pdef["base"]}
+        if pdef["api"] == "ollama":
+            OLLAMA_MODEL = model
+            OLLAMA_BASE = url or pdef["base"]
+            upd["SA_OLLAMA_MODEL"] = OLLAMA_MODEL
+            upd["OLLAMA_URL"] = OLLAMA_BASE
+        else:
+            upd["SA_KEY"] = key
+            if k in _KEY_ENV:
+                upd[_KEY_ENV[k]] = key
         try:
-            if k == "ollama":
-                OLLAMA_MODEL = model or OLLAMA_MODEL
-                OLLAMA_BASE = url or OLLAMA_BASE
-                upd = {"SA_PROVIDER": "ollama", "SA_OLLAMA_MODEL": OLLAMA_MODEL,
-                       "OLLAMA_URL": OLLAMA_BASE}
-            else:
-                DS_MODEL = model or DS_MODEL
-                DS_BASE = url or DS_BASE
-                if key and key != "本地模型不需要 key":
-                    DS_KEY = key
-                upd = {"SA_PROVIDER": "deepseek", "SA_DEEPSEEK_MODEL": DS_MODEL,
-                       "SA_DEEPSEEK_BASE": DS_BASE, "DEEPSEEK_API_KEY": DS_KEY}
-            PROVIDER = k
-            MODEL_LABEL = OLLAMA_MODEL if k == "ollama" else DS_MODEL
             write_env(upd)
         except Exception as e:
             self.pmsg.configure(text="保存失败：%s" % e, fg=ACCENT)
             return
 
+        PROVIDER = k
+        DS_MODEL = model
+        DS_BASE = url or pdef["base"]
+        if key:
+            DS_KEY = key
+        MODEL_LABEL = model
+        self.cost_known = True
         self.model_lbl.configure(text=self._model_text())
         self.messages = []
         self._close_panel()
@@ -890,8 +1006,9 @@ class App:
         self._insert("CONFIG APPLIED\n", "meta")
         self._insert("%s · %s\n" % (PROVIDER, MODEL_LABEL), "meta")
         self.set_status("APPLIED", ACCENT)
-        log("config applied provider=%s model=%s" % (PROVIDER, MODEL_LABEL))
-        if PROVIDER == "ollama":
+        log("config applied provider=%s api=%s model=%s"
+            % (PROVIDER, prov()["api"], MODEL_LABEL))
+        if prov()["api"] == "ollama":
             self._warmup()
 
     # ---------------- 截图 ----------------
@@ -1076,6 +1193,7 @@ class App:
         self._tok_pending = 0
         self._tok_shown = -1
         self._tok_live = True
+        self.cost_known = True
         self._tok_show()
         self.send_btn.configure(bg=PANEL, fg=DIM, text="WAIT")
         self.set_status("STREAMING", ACCENT)
@@ -1097,6 +1215,27 @@ class App:
         threading.Thread(target=self._worker, args=(list(self.messages),), daemon=True).start()
 
     @staticmethod
+    def _to_anthropic(msgs):
+        """转 Anthropic Messages：图片走 base64 source，角色必须交替。"""
+        out = []
+        for m in msgs:
+            role = m.get("role") or "user"
+            imgs = m.get("images") or []
+            if imgs:
+                content = [{"type": "image",
+                            "source": {"type": "base64", "media_type": "image/jpeg",
+                                       "data": b}} for b in imgs]
+                content.append({"type": "text", "text": m.get("content") or ""})
+                out.append({"role": role, "content": content})
+            else:
+                txt = m.get("content") or ""
+                if out and out[-1]["role"] == role and isinstance(out[-1]["content"], str):
+                    out[-1]["content"] += "\n" + txt
+                else:
+                    out.append({"role": role, "content": txt})
+        return out
+
+    @staticmethod
     def _to_openai(msgs):
         out = []
         for m in msgs:
@@ -1113,7 +1252,8 @@ class App:
     def _worker(self, msgs):
         acc = ""
         try:
-            if PROVIDER == "ollama":
+            api_kind = prov()["api"]
+            if api_kind == "ollama":
                 payload = {
                     "model": OLLAMA_MODEL,
                     "messages": msgs,
@@ -1143,6 +1283,54 @@ class App:
                             self.ui_q.put(("usage", (j.get("prompt_eval_count") or 0,
                                                      j.get("eval_count") or 0, 0)))
                             break
+            elif api_kind == "anthropic":
+                if not DS_KEY:
+                    raise RuntimeError("缺少 API KEY —— 点顶栏 API 填写")
+                payload = {
+                    "model": DS_MODEL,
+                    "messages": self._to_anthropic(msgs),
+                    "max_tokens": 3000,
+                    "stream": True,
+                }
+                req = urllib.request.Request(
+                    endpoint("/v1/messages"),
+                    data=json.dumps(payload).encode(),
+                    headers={"Content-Type": "application/json",
+                             "x-api-key": DS_KEY,
+                             "anthropic-version": "2023-06-01"},
+                )
+                t_in = 0
+                t_hit = 0
+                with urllib.request.urlopen(req, timeout=300) as r:
+                    for raw in r:
+                        line = raw.decode("utf-8", "ignore").strip()
+                        if not line.startswith("data:"):
+                            continue
+                        d = line[5:].strip()
+                        if not d or d == "[DONE]":
+                            continue
+                        try:
+                            j = json.loads(d)
+                        except Exception:
+                            continue
+                        et = j.get("type")
+                        if et == "content_block_delta":
+                            dl = (j.get("delta") or {}).get("text")
+                            if dl:
+                                acc += dl
+                                self._tok_pending = len(acc)
+                                self.ui_q.put(("delta", dl))
+                        elif et == "message_start":
+                            u = (j.get("message") or {}).get("usage") or {}
+                            t_hit = u.get("cache_read_input_tokens") or 0
+                            t_in = (u.get("input_tokens") or 0) + t_hit
+                        elif et == "message_delta":
+                            u = j.get("usage") or {}
+                            if u.get("output_tokens") is not None:
+                                self.ui_q.put(("usage", (t_in, u.get("output_tokens") or 0, t_hit)))
+                        elif et == "error":
+                            er = (j.get("error") or {}).get("message") or "anthropic error"
+                            raise RuntimeError(er)
             else:
                 if not DS_KEY:
                     raise RuntimeError("缺少 API KEY —— 点顶栏 API 填写")
@@ -1151,9 +1339,10 @@ class App:
                     "messages": self._to_openai(msgs),
                     "stream": True,
                     "max_tokens": 3000,
-                    "thinking": {"type": "disabled"},
                 }
-                if "deepseek.com" in deepseek_url():
+                if PROVIDER == "deepseek":
+                    payload["thinking"] = {"type": "disabled"}
+                if PROVIDER in ("deepseek", "openai", "openrouter"):
                     payload["stream_options"] = {"include_usage": True}
                 req = urllib.request.Request(
                     deepseek_url(),
@@ -1181,9 +1370,11 @@ class App:
                             self.ui_q.put(("delta", delta))
                         u = j.get("usage")
                         if u:
+                            ch_hit = (u.get("prompt_cache_hit_tokens")
+                                      or (u.get("prompt_tokens_details") or {}).get("cached_tokens")
+                                      or 0)
                             self.ui_q.put(("usage", (u.get("prompt_tokens") or 0,
-                                                     u.get("completion_tokens") or 0,
-                                                     u.get("prompt_cache_hit_tokens") or 0)))
+                                                     u.get("completion_tokens") or 0, ch_hit)))
             self.ui_q.put(("done", acc))
         except urllib.error.HTTPError as e:
             body = e.read().decode("utf-8", "ignore")[:300]
@@ -1227,7 +1418,7 @@ class App:
             text="TOK  \u2191%s  \u2193%s  \u03a3%s \u00b7 %s"
                  % (self._fmt_tok(inn), self._fmt_tok(out),
                     self._fmt_tok(self.tok_in + self.tok_out),
-                    self._fmt_cny(self.cost_usd)),
+                    self._fmt_cny(self.cost_usd) if self.cost_known else "\u00a5\u2014"),
             fg=MUTED)
 
     def _insert(self, s, tag):
@@ -1248,8 +1439,10 @@ class App:
                 elif kind == "usage":
                     self.tok_in += payload[0]
                     self.tok_out += payload[1]
-                    self.cost_usd += token_cost(payload[0], payload[1],
-                                                payload[2] if len(payload) > 2 else 0)
+                    _c = token_cost(payload[0], payload[1],
+                                    payload[2] if len(payload) > 2 else 0)
+                    self.cost_usd += _c or 0.0
+                    self.cost_known = self.cost_known and (_c is not None)
                     self._tok_live = False
                     self._tok_show(payload[0], payload[1])
                 elif kind == "done":
