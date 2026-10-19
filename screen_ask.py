@@ -55,7 +55,7 @@ ACCENT = "#ff4a1c"
 PH = "问这个画面里的任何东西…"
 
 # 基准尺寸（96 DPI 下的逻辑像素），实际窗口按屏幕与 DPI 自适应
-BASE_W, BASE_H = 720, 840
+BASE_W, BASE_H = 760, 840
 MIN_W, MIN_H = 520, 560
 
 FONT_STACK_SANS = (
@@ -71,7 +71,7 @@ FONT_STACK_MONO = (
 SANS = "TkDefaultFont"
 MONO = "TkFixedFont"
 PIX = ""          # 点阵字体，仅用于纯 ASCII 标签
-PIX_SZ = 7        # 像素单位（负数），不随 DPI 缩放，保住点阵
+PIX_SZ = -20      # 像素单位（负数），不随 DPI 缩放，保住点阵
 
 
 def init_fonts(root: tk.Misc) -> None:
@@ -93,7 +93,7 @@ def init_fonts(root: tk.Misc) -> None:
     # 点阵字体：Windows 的 Terminal 原生 8x12，只有 8pt / -12px 才不被抗锯齿
     pix = pick(("Terminal", "Fixedsys"), "")
     if pix:
-        PIX, PIX_SZ = pix, -12
+        PIX, PIX_SZ = pix, -20
     else:
         PIX, PIX_SZ = MONO, 7
 
@@ -386,10 +386,10 @@ class App:
         sh = self.root.winfo_screenheight()
         sc = self.scale
 
-        W = int(max(MIN_W, min(BASE_W * sc, sw * 0.42)))
+        W = int(max(MIN_W, min(BASE_W * sc, sw * 0.46)))
         H = int(max(MIN_H, min(BASE_H * sc, sh * 0.90)))
         self.W, self.H = W, H
-        self.VIEW_H = int(max(180, min(360, H * 0.36)))
+        self.VIEW_H = int(max(180, min(W * 9 / 16, H * 0.52)))
 
         x = max(16, sw - W - int(48 * sc))
         y = max(24, (sh - H) // 2)
@@ -408,24 +408,24 @@ class App:
         shell.pack(fill="both", expand=True, padx=1, pady=1)
 
         # --- 顶栏 ---
-        bar = tk.Frame(shell, bg=PANEL, height=int(38 * min(sc, 2)))
+        bar = tk.Frame(shell, bg=PANEL, height=int(50 * min(sc, 2)))
         bar.pack(fill="x")
         bar.pack_propagate(False)
 
         tk.Label(bar, text="SCR-01", bg=PANEL, fg=MUTED,
                  font=(PIX, PIX_SZ)).pack(side="left", padx=(14, 0))
-        tk.Frame(bar, bg=LINE2, width=1, height=14).pack(side="left", padx=10, pady=12)
+        tk.Frame(bar, bg=LINE2, width=1, height=20).pack(side="left", padx=12, pady=15)
         tk.Label(bar, text="屏幕问答", bg=PANEL, fg=INK,
-                 font=(SANS, 10, "bold")).pack(side="left")
+                 font=(SANS, 12, "bold")).pack(side="left")
 
-        close = tk.Label(bar, text="✕", bg=PANEL, fg=DIM, font=(MONO, 10), cursor="hand2")
+        close = tk.Label(bar, text="✕", bg=PANEL, fg=DIM, font=(MONO, 13), cursor="hand2")
         close.pack(side="right", padx=(0, 14))
         self.status = tk.Label(bar, text="READY", bg=PANEL, fg=MUTED, font=(PIX, PIX_SZ))
-        self.status.pack(side="right", padx=(0, 16))
+        self.status.pack(side="right", padx=(0, 20))
         self.api_lbl = tk.Label(bar, text="API", bg=PANEL, fg=MUTED, font=(PIX, PIX_SZ), cursor="hand2")
-        self.api_lbl.pack(side="right", padx=(0, 16))
+        self.api_lbl.pack(side="right", padx=(0, 20))
         self.model_lbl = tk.Label(bar, text=self._model_text(), bg=PANEL, fg=MUTED, font=(PIX, PIX_SZ))
-        self.model_lbl.pack(side="right", padx=(0, 16))
+        self.model_lbl.pack(side="right", padx=(0, 20))
 
         self.api_lbl.bind("<Button-1>", lambda e: self._open_api_panel())
         self.api_lbl.bind("<Enter>", lambda e: self.api_lbl.configure(fg=ACCENT))
@@ -451,13 +451,13 @@ class App:
 
         dw = tk.Frame(self.view, bg=LINE2)
         dw.place(x=10, y=10)
-        self.dim_tag = tk.Label(dw, text="--", bg=PANEL, fg=MUTED, font=(PIX, PIX_SZ), padx=7, pady=3)
+        self.dim_tag = tk.Label(dw, text="--", bg=PANEL, fg=MUTED, font=(PIX, PIX_SZ), padx=9, pady=5)
         self.dim_tag.pack(padx=1, pady=1)
 
         rw = tk.Frame(self.view, bg=LINE2)
         rw.place(relx=1.0, x=-10, y=10, anchor="ne")
         self.recap = tk.Label(rw, text="RECAPTURE", bg=PANEL, fg=INK, font=(PIX, PIX_SZ),
-                              padx=7, pady=3, cursor="hand2")
+                              padx=9, pady=5, cursor="hand2")
         self.recap.pack(padx=1, pady=1)
         self.recap.bind("<Button-1>", lambda e: self.resnap())
         self.recap.bind("<Enter>", lambda e: self.recap.configure(bg=ACCENT, fg="#0b0b0d"))
@@ -467,13 +467,13 @@ class App:
 
         # --- 对话流 ---
         self.text = tk.Text(shell, bg=BG, fg=INK, bd=0, highlightthickness=0,
-                            wrap="word", height=6, font=(SANS, 10),
+                            wrap="word", height=6, font=(SANS, 12),
                             padx=18, pady=4, spacing1=0, spacing2=2, spacing3=0,
                             insertbackground=ACCENT, cursor="arrow")
         self.text.pack(fill="both", expand=True)
         self.text.tag_configure("you", font=(PIX, PIX_SZ), foreground=ACCENT, spacing1=16)
         self.text.tag_configure("ai", font=(PIX, PIX_SZ), foreground=DIM, spacing1=16)
-        self.text.tag_configure("body", font=(SANS, 10), foreground=INK,
+        self.text.tag_configure("body", font=(SANS, 12), foreground=INK,
                                 spacing1=4, spacing3=10, lmargin1=0, lmargin2=0)
         self.text.tag_configure("meta", font=(PIX, PIX_SZ), foreground=DIM, spacing3=10)
         self.text.tag_configure("err", font=(MONO, 8), foreground=ACCENT, spacing3=10)
@@ -486,7 +486,7 @@ class App:
         foot.pack(fill="x")
 
         self.entry = tk.Text(foot, bg=PANEL, fg=INK, bd=0, highlightthickness=0,
-                             height=2, width=1, font=(SANS, 10), padx=18, pady=10,
+                             height=3, width=1, font=(SANS, 11), padx=18, pady=12,
                              insertbackground=ACCENT, wrap="word",
                              selectbackground=LINE2, selectforeground=INK)
         self.entry.pack(side="left", fill="both", expand=True)
@@ -498,15 +498,15 @@ class App:
 
         btnwrap = tk.Frame(foot, bg=LINE2)
         btnwrap.pack(side="right", padx=(8, 18), pady=(10, 0), anchor="n")
-        self.send_btn = tk.Label(btnwrap, text="SEND", bg=PANEL, fg=INK,
-                                 font=(PIX, -12), padx=20, pady=9, cursor="hand2")
+        self.send_btn = tk.Label(btnwrap, text="SEND", bg=PANEL, fg=ACCENT,
+                                 font=(PIX, PIX_SZ), padx=22, pady=12, cursor="hand2")
         self.send_btn.pack(padx=1, pady=1)
         self.send_btn.bind("<Button-1>", lambda e: self._on_send())
         self.send_btn.bind("<Enter>", lambda e: self._btn_hover(True))
         self.send_btn.bind("<Leave>", lambda e: self._btn_hover(False))
 
-        tk.Label(foot, text="ENTER SEND    ESC HIDE    ^R RECAP", bg=PANEL, fg=DIM,
-                 font=(PIX, -12)).pack(side="bottom", anchor="w", padx=18, pady=(0, 10))
+        tk.Label(foot, text="ENTER SEND    ESC HIDE    ^R RECAP", bg=PANEL, fg=MUTED,
+                 font=(PIX, PIX_SZ)).pack(side="bottom", anchor="w", padx=18, pady=(0, 10))
 
         win.bind("<Escape>", lambda e: (self._close_panel() if self.panel else self.hide()))
         win.bind("<Control-r>", lambda e: self.resnap())
@@ -524,7 +524,7 @@ class App:
     def _btn_hover(self, on):
         if self.busy:
             return
-        self.send_btn.configure(bg=ACCENT if on else PANEL, fg="#0b0b0d" if on else INK)
+        self.send_btn.configure(bg=ACCENT if on else PANEL, fg="#0b0b0d" if on else ACCENT)
 
     def _placeholder(self):
         self.entry.insert("1.0", PH)
@@ -583,7 +583,7 @@ class App:
         zoom_lbl.pack(side="right", padx=(0, 14))
         if vw >= 900:
             tk.Label(head, text="SCROLL ZOOM / DRAG PAN / DBLCLICK FIT", bg=PANEL, fg=LINE2,
-                     font=(PIX, -12)).pack(side="right", padx=(0, 12))
+                     font=(PIX, PIX_SZ)).pack(side="right", padx=(0, 12))
         cls = tk.Label(head, text="✕", bg=PANEL, fg=DIM, font=(MONO, 10), cursor="hand2")
         cls.pack(side="right", padx=(0, 10))
         cls.bind("<Button-1>", lambda e: top.destroy())
@@ -745,14 +745,14 @@ class App:
                              bg=PANEL, fg=DIM, font=(MONO, 7))
         self.pmsg.pack(side="left")
         applyb = tk.Label(row, text="APPLY", bg=ACCENT, fg="#0b0b0d",
-                          font=(PIX, -12), padx=20, pady=7, cursor="hand2")
+                          font=(PIX, PIX_SZ), padx=22, pady=9, cursor="hand2")
         applyb.pack(side="right")
         applyb.bind("<Button-1>", lambda e: self._apply_config())
 
         body = tk.Frame(p, bg=BG)
         body.pack(fill="both", expand=True, padx=18, pady=16)
 
-        tk.Label(body, text="PROVIDER", bg=BG, fg=DIM, font=(PIX, -12)).pack(anchor="w")
+        tk.Label(body, text="PROVIDER", bg=BG, fg=DIM, font=(PIX, PIX_SZ)).pack(anchor="w")
         tabs = tk.Frame(body, bg=BG)
         tabs.pack(anchor="w", pady=(6, 18))
         self.pv = tk.StringVar(value=PROVIDER)
@@ -767,11 +767,11 @@ class App:
             self.tab_map[key] = lb
 
         def field(label, default, show=None):
-            tk.Label(body, text=label, bg=BG, fg=DIM, font=(PIX, -12)).pack(anchor="w", pady=(0, 4))
+            tk.Label(body, text=label, bg=BG, fg=DIM, font=(PIX, PIX_SZ)).pack(anchor="w", pady=(0, 4))
             wrap = tk.Frame(body, bg=LINE)
             wrap.pack(fill="x", pady=(0, 14))
             e = tk.Entry(wrap, bg=PANEL, fg=INK, bd=0, highlightthickness=0,
-                         font=(MONO, 9), insertbackground=ACCENT, show=show,
+                         font=(SANS, 12), insertbackground=ACCENT, show=show,
                          disabledbackground=SUNK, disabledforeground=DIM,
                          readonlybackground=SUNK, selectbackground=LINE2)
             e.pack(fill="x", padx=1, pady=1, ipady=6)
@@ -932,7 +932,7 @@ class App:
             frame = self._crt_base.copy()
             draw_scanlines(frame, self._crt_phase)
             self._paint(frame)
-        self.root.after(190, self._crt_tick)
+        self.root.after(260, self._crt_tick)
 
     # ---------------- 开机动画 ----------------
     def boot_then_capture(self):
@@ -944,13 +944,13 @@ class App:
         cover = tk.Frame(self.win, bg=BG)
         cover.place(x=0, y=0, relwidth=1, relheight=1)
         t = tk.Text(cover, bg=BG, fg=MUTED, bd=0, highlightthickness=0,
-                    font=(PIX, -12), padx=26, pady=22, spacing1=3, spacing3=3,
+                    font=(PIX, PIX_SZ), padx=26, pady=22, spacing1=3, spacing3=3,
                     cursor="arrow")
         t.pack(fill="both", expand=True)
         t.configure(state="disabled")
-        t.tag_configure("hdr", foreground=ACCENT, font=(PIX, -12))
-        t.tag_configure("dim", foreground=LINE2, font=(PIX, -12))
-        t.tag_configure("ok", foreground=DIM, font=(PIX, -12))
+        t.tag_configure("hdr", foreground=ACCENT, font=(PIX, PIX_SZ))
+        t.tag_configure("dim", foreground=LINE2, font=(PIX, PIX_SZ))
+        t.tag_configure("ok", foreground=DIM, font=(PIX, PIX_SZ))
         t.tag_configure("bar", foreground=ACCENT)
 
         rows = [
@@ -1150,7 +1150,7 @@ class App:
                 elif kind == "done":
                     self.messages.append({"role": "assistant", "content": payload})
                     self.busy = False
-                    self.send_btn.configure(bg=PANEL, fg=INK, text="SEND")
+                    self.send_btn.configure(bg=PANEL, fg=ACCENT, text="SEND")
                     el = time.time() - self.t0
                     if not payload:
                         self._insert("(空回复)\n", "err")
@@ -1159,7 +1159,7 @@ class App:
                     self.set_status("READY · %.1fs" % el, DIM)
                 elif kind == "err":
                     self.busy = False
-                    self.send_btn.configure(bg=PANEL, fg=INK, text="SEND")
+                    self.send_btn.configure(bg=PANEL, fg=ACCENT, text="SEND")
                     self._insert("\n" + payload + "\n", "err")
                     self.set_status("ERROR", ACCENT)
         except queue.Empty:
