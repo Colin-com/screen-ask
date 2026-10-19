@@ -1,0 +1,38 @@
+[build-system]
+requires = ["setuptools>=61"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "screen-ask"
+version = "0.2.0"
+description = "One hotkey, one screenshot, ask a vision model about your screen."
+readme = "README.md"
+requires-python = ">=3.9"
+license = { text = "MIT" }
+authors = [{ name = "Colin" }]
+keywords = ["screenshot", "vision", "llm", "tkinter", "deepseek", "ollama"]
+classifiers = [
+    "Programming Language :: Python :: 3",
+    "Environment :: X11 Applications",
+    "Environment :: Win32 (MS Windows)",
+    "License :: OSI Approved :: MIT License",
+    "Operating System :: OS Independent",
+    "Topic :: Multimedia :: Graphics :: Capture :: Screen Capture",
+]
+dependencies = ["Pillow>=9.0"]
+
+[project.optional-dependencies]
+# 非 Windows 平台的全局热键
+hotkey = ["keyboard>=0.13"]
+
+[project.urls]
+Homepage = "https://github.com/Colin-com/screen-ask"
+
+[project.scripts]
+screen-ask = "screen_ask:main"
+
+[tool.setuptools]
+py-modules = ["screen_ask"]
+
+[tool.setuptools.package-data]
+screen_ask = ["*.md"]

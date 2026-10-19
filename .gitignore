@@ -1,0 +1,21 @@
+# 依赖
+__pycache__/
+*.py[cod]
+*.egg-info/
+build/
+dist/
+.venv/
+venv/
+
+# 本地配置与日志
+.env
+run.log
+*.log
+
+# 开发期截图（docs 里的保留）
+*.png
+!docs/*.png
+
+# 系统
+.DS_Store
+Thumbs.db
