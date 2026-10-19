@@ -110,6 +110,8 @@ def token_cost(prompt, completion, cache_hit=0, model=None):
     return (hit * p_hit + miss * p_in + completion * p_out) * mult / 1e6
 
 # 基准尺寸（96 DPI 下的逻辑像素），实际窗口按屏幕与 DPI 自适应
+VERSION = "0.3.0"
+
 BASE_W, BASE_H = 760, 840
 MIN_W, MIN_H = 520, 560
 
@@ -1431,8 +1433,23 @@ class App:
 
         W = int(max(MIN_W, min(BASE_W * sc, sw * 0.46)))
         H = int(max(MIN_H, min(BASE_H * sc, sh * 0.90)))
+        # 上次拖过的窗口大小优先：overrideredirect 窗口没有系统记忆，只能自己存
+        try:
+            W = int(ENV.get("SA_WIN_W") or W)
+            H = int(ENV.get("SA_WIN_H") or H)
+        except (TypeError, ValueError):
+            pass
+        W = int(max(MIN_W, min(W, sw - 40)))
+        H = int(max(MIN_H, min(H, sh - 60)))
         self.W, self.H = W, H
-        self.VIEW_H = int(max(180, min(W * 9 / 16, H * 0.52)))
+        # 取景器 / 对话框的高度比例（0.12~0.78 之外视为没存过或拖坏了）
+        try:
+            self.split_ratio = float(ENV.get("SA_SPLIT") or 0)
+        except (TypeError, ValueError):
+            self.split_ratio = 0.0
+        if not 0.12 < self.split_ratio < 0.78:
+            self.split_ratio = int(max(180, min(W * 9 / 16, H * 0.52))) / float(H)
+        self.VIEW_H = self._split_px()
 
         x = max(16, sw - W - int(48 * sc))
         y = max(24, (sh - H) // 2)
@@ -1442,13 +1459,34 @@ class App:
         win.title("Screen Ask")
         if not IS_MAC:                       # macOS 下 overrideredirect 会收不到键盘
             win.overrideredirect(True)
-        win.attributes("-topmost", True)
+        # 不置顶：用户明确要求别钉在最前面。按热键时会 lift() 自己冒出来，
+        # 平时和其它窗口一样按 Z 序排队（想看大图另有全屏 viewer，那个仍置顶）。
         win.geometry("%dx%d+%d+%d" % (W, H, x, y))
         win.configure(bg=LINE2)              # 1px 外描边
         win.withdraw()
 
         shell = tk.Frame(win, bg=BG)
         shell.pack(fill="both", expand=True, padx=1, pady=1)
+
+        # --- 自绘缩放边（overrideredirect 没有系统边框，缩放只能自己做）---
+        grip_e = tk.Frame(win, bg=BG, width=5, cursor="sb_h_double_arrow")
+        grip_e.place(relx=1.0, rely=0.0, relheight=1.0, x=-5, anchor="ne")
+        grip_s = tk.Frame(win, bg=BG, height=5, cursor="sb_v_double_arrow")
+        grip_s.place(relx=0.0, rely=1.0, relwidth=1.0, y=-5, anchor="sw")
+        for g, edge in ((grip_e, "e"), (grip_s, "s")):
+            g.bind("<Button-1>", lambda e, edge=edge: self._resize_start(e, edge))
+            g.bind("<B1-Motion>", self._resize_move)
+            g.bind("<ButtonRelease-1>", lambda e: self._save_ui())
+
+        grip_se = tk.Canvas(win, bg=BG, width=20, height=20, highlightthickness=0,
+                            cursor="size_nw_se")
+        grip_se.place(relx=1.0, rely=1.0, x=-2, y=-2, anchor="se")
+        for i in (5, 9, 13):                # 三条斜线，右下角的缩放记号
+            # width=2 是必须的：1px 线在 150% 缩放下被抗锯齿掺成背景色，实际看不见
+            grip_se.create_line(i, 18, 18, i, fill=MUTED, width=2)
+        grip_se.bind("<Button-1>", lambda e: self._resize_start(e, "se"))
+        grip_se.bind("<B1-Motion>", self._resize_move)
+        grip_se.bind("<ButtonRelease-1>", lambda e: self._save_ui())
 
         # --- 顶栏 ---
         bar = tk.Frame(shell, bg=PANEL, height=int(50 * min(sc, 2)))
@@ -1506,7 +1544,18 @@ class App:
         self.recap.bind("<Enter>", lambda e: self.recap.configure(bg=ACCENT, fg="#0b0b0d"))
         self.recap.bind("<Leave>", lambda e: self.recap.configure(bg=PANEL, fg=INK))
 
-        tk.Frame(shell, bg=LINE, height=1).pack(fill="x")
+        # --- 取景器 / 对话流的比例分隔条 ---
+        # 视觉还是 1px 细线，但命中区有 7px，鼠标经过变红提示可拖。
+        self.split = tk.Frame(shell, bg=BG, height=7, cursor="sb_v_double_arrow")
+        self.split.pack(fill="x")
+        self.split.pack_propagate(False)
+        self.split_line = tk.Frame(self.split, bg=LINE, height=1)
+        self.split_line.place(x=0, rely=0.5, relwidth=1.0, y=-1)
+        self.split.bind("<Button-1>", self._split_press)
+        self.split.bind("<B1-Motion>", self._split_move)
+        self.split.bind("<ButtonRelease-1>", self._split_release)
+        self.split.bind("<Enter>", lambda e: self.split_line.configure(bg=ACCENT))
+        self.split.bind("<Leave>", lambda e: self.split_line.configure(bg=LINE))
 
         # --- 对话流 ---
         self.text = tk.Text(shell, bg=BG, fg=INK, bd=0, highlightthickness=0,
@@ -1588,6 +1637,80 @@ class App:
         if not self.entry.get("1.0", "end").strip():
             self.entry.insert("1.0", PH)
             self.entry.configure(fg=MUTED)
+
+    # ---------------- 尺寸 / 比例 ----------------
+    def _split_px(self):
+        """取景器高度：按比例算，夹在 [120, H-260]，别把对话区挤没。"""
+        vh = int(self.H * getattr(self, "split_ratio", 0.4))
+        return int(max(120, min(vh, max(120, self.H - 260))))
+
+    def _apply_split(self):
+        self.VIEW_H = self._split_px()
+        if getattr(self, "view", None) is not None:
+            self.view.configure(height=self.VIEW_H)
+
+    def _split_press(self, e):
+        self._split_dragging = True
+        self.split_line.configure(bg=ACCENT)
+
+    def _split_move(self, e):
+        if not getattr(self, "_split_dragging", False):
+            return
+        vh = e.y_root - self.view.winfo_rooty()
+        vh = max(120, min(vh, max(120, self.H - 260)))
+        self.VIEW_H = vh
+        self.view.configure(height=vh)
+        self.split_ratio = vh / float(max(1, self.H))
+
+    def _split_release(self, e):
+        self._split_dragging = False
+        self.split_line.configure(bg=LINE)
+        self._repaint_thumb()
+        self._save_ui()
+
+    def _resize_start(self, e, edge):
+        self._rs = (edge, e.x_root, e.y_root,
+                    self.win.winfo_width(), self.win.winfo_height())
+
+    def _resize_move(self, e):
+        if not getattr(self, "_rs", None):
+            return
+        edge, x0, y0, w0, h0 = self._rs
+        w = max(MIN_W, w0 + (e.x_root - x0)) if "e" in edge else w0
+        h = max(MIN_H, h0 + (e.y_root - y0)) if "s" in edge else h0
+        # 别拉到屏幕外：拉出去的边就看不到、也抓不回来了
+        w = min(w, self.win.winfo_screenwidth() - 24)
+        h = min(h, self.win.winfo_screenheight() - 48)
+        self.win.geometry("%dx%d" % (w, h))
+        self.W, self.H = w, h
+        self._apply_split()
+
+    def _save_ui(self):
+        """拖完停 600ms 再落盘，别每帧写一次 .env。"""
+        if getattr(self, "_save_job", None):
+            try:
+                self.root.after_cancel(self._save_job)
+            except Exception:
+                pass
+        self._save_job = self.root.after(600, self._save_ui_now)
+
+    def _save_ui_now(self):
+        self._save_job = None
+        try:
+            write_env({"SA_WIN_W": self.W, "SA_WIN_H": self.H,
+                       "SA_SPLIT": "%.3f" % self.split_ratio})
+        except Exception:
+            log("save ui failed\n" + traceback.format_exc())
+
+    def _repaint_thumb(self):
+        """改完比例把缩略图按新高度重画一次，否则会被拉扁。"""
+        img = getattr(self, "full_img", None)
+        if img is None:
+            return
+        try:
+            self._paint(crt_frame(img, self.VIEW_H, block=2))
+        except Exception:
+            log("repaint thumb failed\n" + traceback.format_exc())
 
     def _drag_start(self, e):
         self._dx, self._dy = e.x_root - self.win.winfo_x(), e.y_root - self.win.winfo_y()
@@ -2014,7 +2137,7 @@ class App:
 
         rows = [
             ("SCR-01 // SCREEN ASK", "hdr"),
-            ("8-bit capture console  v0.3", "dim"),
+            ("8-bit capture console  v%s" % VERSION, "dim"),
             ("", None),
             ("> display ....... %d x %d @ %d%%" % (
                 self.root.winfo_screenwidth(), self.root.winfo_screenheight(),
