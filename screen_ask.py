@@ -927,7 +927,8 @@ class App:
     def _crt_tick(self):
         """静态时扫描线缓慢下移——画面是「活的」，但不重新解码整张图。"""
         if (self._crt_on and self._crt_base is not None
-                and self.win.winfo_viewable() and not self.busy):
+                and self.win.winfo_viewable() and not self.busy
+                and getattr(self, "viewer", None) is None):
             self._crt_phase = (self._crt_phase + 1) % 3
             frame = self._crt_base.copy()
             draw_scanlines(frame, self._crt_phase)
