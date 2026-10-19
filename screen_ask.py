@@ -1322,8 +1322,8 @@ def split_math(s):
     for i, chunk in enumerate(FENCE_SPLIT.split(s)):
         if not chunk:
             continue
-        if i % 2:                       # ```...``` 原样保留
-            out.append(("text", chunk))
+        if i % 2:                       # ```...``` 原样保留，里面的 ** 不当作粗体
+            out.append(("code", chunk))
             continue
         for seg in _split_inline(chunk.replace("\\$", ESC_DOLLAR)):
             if seg[0] == "text":
@@ -1518,6 +1518,7 @@ class App:
         self.text.tag_configure("ai", font=(PIX, PIX_SZ), foreground=DIM, spacing1=16)
         self.text.tag_configure("body", font=(SANS, 12), foreground=INK,
                                 spacing1=4, spacing3=10, lmargin1=0, lmargin2=0)
+        self.text.tag_configure("bold", font=(SANS, 12, "bold"))
         self.text.tag_configure("meta", font=(PIX, PIX_SZ), foreground=DIM, spacing3=10)
         self.text.tag_configure("err", font=(MONO, 8), foreground=ACCENT, spacing3=10)
         self.text.configure(state="disabled")
@@ -2365,17 +2366,35 @@ class App:
         self.text.image_create("end", image=ph, align="center", padx=3, pady=0)
         return True
 
+    def _emit_text(self, t, tag="body"):
+        """正文里 **粗体** 变真粗体。
+
+        用状态机而不是正则：\`\`**加粗含 $x^2$ 公式**\`\` 会被 split_math 切成几段，
+        正则各段匹配不上，状态机能跨公式继续加粗。
+        """
+        parts = t.split("**")
+        for i, part in enumerate(parts):
+            if part:
+                self.text.insert("end", part, (tag, "bold") if self._bold_on else tag)
+            if i < len(parts) - 1:
+                self._bold_on = not self._bold_on
+
     def _emit(self, src, tag="body"):
         """按 $...$ / $$...$$ 切段：文字直插，公式渲染成图片。"""
         prev_disp = False
+        self._bold_on = False
         for seg in split_math(src):
+            if seg[0] == "code":
+                prev_disp = False
+                self.text.insert("end", seg[1], tag)
+                continue
             if seg[0] == "text":
                 t = seg[1]
                 if prev_disp and t.startswith("\n"):
                     t = t[1:]        # 行间公式后面已经补过换行，别再多空一行
                 prev_disp = False
                 if t:
-                    self.text.insert("end", t, tag)
+                    self._emit_text(t, tag)
                 continue
             body, disp = seg[1], seg[2]
             tex = body.strip()
